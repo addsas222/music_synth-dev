@@ -46,7 +46,7 @@ def skip_dir(rel_dir):
         return False
     if rel_dir == 'static/_preview':
         return True
-    return any(p in EXCLUDE_DIR_NAMES or p.startswith('_backup') for p in parts)
+    return any(p in EXCLUDE_DIR_NAMES or p.startswith('_backup') or p.startswith('_bak') for p in parts)
 
 
 def keep(rel):
