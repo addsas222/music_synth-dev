@@ -35,14 +35,27 @@ TORCH_CPU_INDEX = "https://download.pytorch.org/whl/cpu"
 DDSP_ZIP = ("https://codeload.github.com/yxlllc/DDSP-SVC/zip/"
             "b9d4e6a58182448aa7259a636570d53c49c92b1d")
 # ContentVec encoder (contentvec768l12tta2x) — direct HF resolve link.
-CONTENTVEC_URL = ("https://huggingface.co/lengyue233/content-vec-best/resolve/"
-                  "main/pytorch_model.bin")
+# ContentVec encoder (contentvec768l12tta2x). 国内优先镜像，失败再试官方 HF。
+CONTENTVEC_URLS = [
+    "https://hf-mirror.com/lengyue233/content-vec-best/resolve/main/pytorch_model.bin",
+    "https://huggingface.co/lengyue233/content-vec-best/resolve/main/pytorch_model.bin",
+]
+CONTENTVEC_URL = CONTENTVEC_URLS[0]
 # NSF-HiFiGAN vocoder (pc_nsf_hifigan 44.1k hop512 128bin 2025.02).
 VOCODER_ZIP = ("https://github.com/openvpi/vocoders/releases/download/"
                "pc-nsf-hifigan-44.1k-hop512-128bin-2025.02/"
                "pc_nsf_hifigan_44.1k_hop512_128bin_2025.02.zip")
 # RMVPE f0 extractor (230917 release).
 RMVPE_ZIP = "https://github.com/yxlllc/RMVPE/releases/download/230917/rmvpe.zip"
+# DDSP-SVC 6.3 训练底模（RectifiedFlow pretrain）。上游只有 SVCFusion 的
+# .sf_dlc 包（本质是 torch zip，里面 files.model_0.pt 才是标准检查点），
+# 安装时下载后转成 model_0.pt。国内优先 hf-mirror，失败再试 huggingface。
+REFLOW_BASE_URLS = [
+    ("https://hf-mirror.com/SVCFusion/DDSP6.3-Pretrain/resolve/main/"
+     "ddsp6.3_6x512_6x1024.sf_dlc"),
+    ("https://huggingface.co/SVCFusion/DDSP6.3-Pretrain/resolve/main/"
+     "ddsp6.3_6x512_6x1024.sf_dlc"),
+]
 # Fallback only if the GitHub API is unreachable.
 PYTHON_STANDALONE_PINNED = (
     "https://github.com/astral-sh/python-build-standalone/releases/download/"
@@ -54,6 +67,7 @@ MODEL_ITEMS = {
         "label": "DDSP-SVC ContentVec 编码器（contentvec768l12tta2x）",
         "kind": "http",
         "url": CONTENTVEC_URL,
+        "urls": CONTENTVEC_URLS,
         "target": "ddsp_pretrain_contentvec",
         "subdir": "",
         "size_gb": 0.40,
@@ -64,6 +78,8 @@ MODEL_ITEMS = {
         "kind": "zip",
         "url": VOCODER_ZIP,
         "target": "ddsp_pretrain_vocoder",
+        "zip_mode": "flatten",
+        "rename": {"model.ckpt": "model"},
         "size_gb": 0.05,
         "files": ("model", "config.json"),
     },
@@ -72,12 +88,21 @@ MODEL_ITEMS = {
         "kind": "zip",
         "url": RMVPE_ZIP,
         "target": "ddsp_pretrain_rmvpe",
+        "zip_mode": "into_base",
         "size_gb": 0.06,
         "files": ("model.pt",),
     },
+    "ddsp_reflow_base": {
+        "label": "训练底模（DDSP-SVC 6.3 PT）",
+        "kind": "dlc",
+        "url": REFLOW_BASE_URLS[0],
+        "target": "ddsp_pretrain_reflow",
+        "size_gb": 0.21,
+        "files": ("model_0.pt",),
+    },
     "sep_karaoke": {
         "label": "人声分离权重（Mel-Band RoFormer Karaoke）",
-        "kind": "http",
+        "kind": "sep",
         "target": "sep_model_dir",
         "size_gb": 1.75,
         "files": (
@@ -375,14 +400,21 @@ def _missing_files(spec: dict, target: Path) -> list[str]:
     (no wildcard) is checked exactly, so a sibling file such as
     ``model.raw_sd.pt`` or ``config.json.bak`` never masks a really-missing
     ``model`` / ``config.json``.
-    Anything containing ``*`` / ``?`` / ``[`` keeps the recursive match."""
+    Anything containing ``*`` / ``?`` / ``[`` keeps the recursive match.
+    Paths with a suffix must resolve to a *file* (a same-named directory from a
+    bad zip extraction must not count as ready)."""
     missing = []
     for rel in spec.get("files", ()):
         try:
             if any(ch in rel for ch in "*?["):
                 found = any(target.rglob(Path(rel).name))
             else:
-                found = (target / rel).exists() or (target / Path(rel).name).exists()
+                need_file = bool(Path(rel).suffix)
+                found = False
+                for cand in (target / rel, target / Path(rel).name):
+                    if cand.exists() and (cand.is_file() or not need_file):
+                        found = True
+                        break
         except OSError:
             found = False
         if not found:
@@ -391,46 +423,60 @@ def _missing_files(spec: dict, target: Path) -> list[str]:
 
 
 def _install_zip(spec: dict, dest_root: Path, progress, label: str) -> None:
-    """Download a release zip and place its top folder under ``dest_root``."""
+    """Download a release zip and place its contents under ``dest_root``.
+
+    ``zip_mode``:
+      * ``nest`` (default): a single top folder becomes ``dest_root/<top>``.
+      * ``flatten``: a single top folder's *contents* go directly into
+        ``dest_root`` (vocoder zip).
+      * ``into_base``: loose files / a top folder are flattened into
+        ``dest_root`` itself (rmvpe zip, where dest_root is ``pretrain/rmvpe``).
+    ``rename`` renames extracted entries after placement (model.ckpt -> model).
+    """
     dest_root.mkdir(parents=True, exist_ok=True)
     archive = dest_root.parent / f"_{dest_root.name}_{abs(hash(spec['url'])) % 10**8}.zip"
     _download_file(spec["url"], archive, progress, label)
+    mode = str(spec.get("zip_mode") or "nest")
     with tempfile.TemporaryDirectory(dir=str(dest_root.parent)) as tmp:
         _safe_extract(archive, Path(tmp))
         entries = list(Path(tmp).iterdir())
         folders = [p for p in entries if p.is_dir()]
         files = [p for p in entries if p.is_file()]
-        moves: list[tuple[Path, Path]] = []
-        if len(folders) == 1 and not files:
-            # A single top folder is flattened into dest_root unless dest_root
-            # is itself that folder (e.g. "pretrain/vocoder").
-            top = folders[0]
-            if dest_root.name == top.name:
-                moves = [(top, dest_root)]
-            else:
-                moves = [(top, dest_root / top.name)]
+
+        if mode in ("flatten", "into_base"):
+            src_root = folders[0] if len(folders) == 1 and not files else Path(tmp)
+            for entry in list(src_root.iterdir()):
+                dest = dest_root / entry.name
+                if dest.is_dir():
+                    shutil.rmtree(dest, ignore_errors=True)
+                elif dest.exists():
+                    dest.unlink()
+                shutil.move(str(entry), str(dest))
         else:
-            moves = [(entry, dest_root / entry.name) for entry in entries]
-        try:
+            moves: list[tuple[Path, Path]] = []
+            if len(folders) == 1 and not files:
+                top = folders[0]
+                if dest_root.name == top.name:
+                    moves = [(top, dest_root)]
+                else:
+                    moves = [(top, dest_root / top.name)]
+            else:
+                moves = [(entry, dest_root / entry.name) for entry in entries]
             for src, dest in moves:
                 if dest.is_dir():
-                    # Never delete anything above the destination; only a
-                    # destination that is itself the new model folder gets
-                    # cleared.
                     if dest == dest_root or dest.parent == dest_root:
                         shutil.rmtree(dest, ignore_errors=True)
                     else:
-                        raise RuntimeError(
-                            "目标位置已存在同名目录：" + str(dest)
-                        )
+                        raise RuntimeError("目标位置已存在同名目录：" + str(dest))
                 elif dest.exists():
                     dest.unlink()
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(src), str(dest))
-        except Exception:
-            if set(m[1] for m in moves) == {dest_root} or not dest_root.is_dir():
-                shutil.rmtree(dest_root, ignore_errors=True)
-            raise
+
+        for old, new in (spec.get("rename") or {}).items():
+            src, dest = dest_root / old, dest_root / new
+            if src.is_file() and not dest.exists():
+                src.rename(dest)
     archive.unlink(missing_ok=True)
 
 
@@ -438,11 +484,70 @@ def _download_http_model(paths: dict, spec: dict, progress, label: str) -> None:
     """Download a single-file HTTP model (e.g. ContentVec) with resume support."""
     target_dir = _model_base(spec, Path(paths[spec["target"]]))
     target_dir.mkdir(parents=True, exist_ok=True)
+    urls = spec.get("urls") or [spec["url"]]
     for filename in spec["files"]:
         target = target_dir / filename
         if target.is_file() and target.stat().st_size > 1024:
             continue
-        _download_file(spec["url"], target, progress, f"{label} · {filename}")
+        errors = []
+        for url in urls:
+            try:
+                _download_file(url, target, progress, f"{label} · {filename}", timeout=600)
+                break
+            except (OSError, urllib.error.URLError, RuntimeError) as exc:
+                errors.append(f"{url}: {exc}")
+        else:
+            raise RuntimeError(f"{filename} 下载失败：" + "; ".join(errors)[-1200:])
+
+
+def _install_dlc_model(paths: dict, spec: dict, progress, label: str, python) -> None:
+    """Download a SVCFusion .sf_dlc package and convert it to model_0.pt.
+
+    .sf_dlc is a torch zip whose ``files['model_0.pt']`` is the real
+    checkpoint ({'global_step', 'model'}); DDSP-SVC needs the inner dict saved
+    as a plain .pt.  Conversion runs in the freshly installed DDSP env.
+    """
+    target = Path(paths[spec["target"]])
+    target.parent.mkdir(parents=True, exist_ok=True)
+    dlc = target.with_name(target.name + ".dlc")
+    errors = []
+    for url in REFLOW_BASE_URLS:
+        try:
+            _download_file(url, dlc, progress, label, timeout=600)
+            break
+        except (OSError, urllib.error.URLError, RuntimeError) as exc:
+            errors.append(f"{url}: {exc}")
+            try:
+                dlc.unlink(missing_ok=True)
+            except OSError:
+                pass
+    else:
+        raise RuntimeError("底模下载失败：" + "; ".join(errors)[-1200:])
+
+    py = Path(str(python))
+    if not py.is_file():
+        raise RuntimeError("需要先安装 DDSP 环境才能转换底模")
+    code = (
+        "import sys,torch\n"
+        "p,o=sys.argv[1],sys.argv[2]\n"
+        "try:\n"
+        "    c=torch.load(p,map_location='cpu',weights_only=False)\n"
+        "except TypeError:\n"
+        "    c=torch.load(p,map_location='cpu')\n"
+        "inner=(c.get('files') or {}).get('model_0.pt') if isinstance(c,dict) else None\n"
+        "assert inner is not None,'DLC 里没有 model_0.pt'\n"
+        "torch.save(inner,o)\n"
+    )
+    proc = subprocess.run([str(py), "-c", code, str(dlc), str(target)],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError("底模转换失败：" + ((proc.stderr or proc.stdout or "")[-1000:]))
+    try:
+        dlc.unlink(missing_ok=True)
+    except OSError:
+        pass
+    if not target.is_file() or target.stat().st_size < 100 * 1024 * 1024:
+        raise RuntimeError("底模转换后文件异常")
 
 
 def _sep_weight_urls(filename: str) -> list[str]:
@@ -781,9 +886,15 @@ def install(paths: dict, items: list[str] | None, progress, probe: dict | None =
             continue
         try:
             if spec["kind"] == "zip":
-                _install_zip(spec, _model_zip_dir(spec, target), progress, spec["label"])
+                if str(spec.get("zip_mode") or "") == "into_base":
+                    zip_dest = _model_base(spec, target)
+                else:
+                    zip_dest = _model_zip_dir(spec, target)
+                _install_zip(spec, zip_dest, progress, spec["label"])
             elif spec["kind"] == "http":
                 _download_http_model(paths, spec, progress, spec["label"])
+            elif spec["kind"] == "dlc":
+                _install_dlc_model(paths, spec, progress, spec["label"], synth_py)
             else:
                 _download_sep_weights(paths, progress, spec["label"])
             installed.append(key)

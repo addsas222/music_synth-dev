@@ -489,7 +489,7 @@ def resolve_paths(data_dir: Path, host_section: dict | None = None) -> dict:
         "ddsp_pretrain_reflow": base_ckpt,
         "ddsp_pretrain_contentvec": ddsp_root / "pretrain" / "contentvec" / "pytorch_model.bin",
         "ddsp_pretrain_rmvpe": ddsp_root / "pretrain" / "rmvpe" / "model.pt",
-        "ddsp_pretrain_vocoder": ddsp_root / "pretrain" / "nsf_hifigan" / "vocoder",
+        "ddsp_pretrain_vocoder": ddsp_root / "pretrain" / "nsf_hifigan",
         "ddsp_vocoder_config": ddsp_root / "pretrain" / "nsf_hifigan" / "config.json",
         "sep_model_dir": sep_model_dir,
         "tier_override": str(pick("tier_override") or ""),
