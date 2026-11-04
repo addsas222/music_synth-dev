@@ -150,7 +150,9 @@ class Pipeline:
         self.store = TrackStore(self.data_dir)
         self.paths = runtime.resolve_paths(self.data_dir)
         self.work_dir = Path(self.paths["work_dir"])
-        self.work_dir.mkdir(parents=True, exist_ok=True)
+        # 还没选安装位置时不要在当前目录/别的盘悄悄建 work 目录。
+        if self.paths.get("configured", True):
+            self.work_dir.mkdir(parents=True, exist_ok=True)
         self.log_path = self.data_dir / "pipeline.log"
         self._run_lock = threading.Lock()
         self._busy: set[str] = set()

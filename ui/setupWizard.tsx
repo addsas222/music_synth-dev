@@ -233,13 +233,16 @@ export function SetupWizard(props: { api: any; onDone: () => void; startAt?: num
       </div>
       <label style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: 12, color: INK_2 }}>
         <span>安装到哪里</span>
-        <input value={path} onChange={(e: any) => setPath(e.target.value)} style={{
+        <input value={path} placeholder="例如 D:\\NEKOMusicSynth" onChange={(e: any) => setPath(e.target.value)} style={{
           border: "1px solid " + (lack ? "#e8a3a3" : "transparent"), borderRadius: 12, padding: "10px 14px", fontSize: 13,
           background: lack ? "#fff6f6" : "rgba(248,250,252,0.95)", color: INK, outline: "none",
         }} />
       </label>
+      <Muted>必须自己填一个绝对路径（例如 D:\NEKOMusicSynth）。插件不会自动挑盘，也不会把模型下到别的盘。</Muted>
       <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
-        {freeGb !== null ? (
+        {!path.trim() ? (
+          <StatusBadge tone="warning">请先填写安装目录，否则不会开始下载</StatusBadge>
+        ) : freeGb !== null ? (
           lack
             ? <StatusBadge tone="error">这个盘只剩 {freeGb.toFixed(1)} GB，还要约 {needGb} GB，换一个盘吧</StatusBadge>
             : <StatusBadge tone="success">这个盘还剩 {freeGb.toFixed(1)} GB · 需要约 {needGb} GB</StatusBadge>

@@ -83,8 +83,8 @@ export default function Panel(props: any) {
   const hostState = (props as any).state
   const view = snap || (hostState && typeof hostState === "object" ? hostState : null)
 
-  // 第一次打开：环境没装全就先把向导挡在前面（setup.completed === false）
-  const setupReady = !view || !view.setup || view.setup.completed !== false
+  // 第一次打开：环境没装全就先把向导挡在前面（必须显式 completed=true 才算装好）
+  const setupReady = !view || !view.setup || view.setup.completed === true
   useEffect(() => {
     if (!setupReady) setWizard(true)
     else if (wizardStartAt()) setWizard(true) // 预览：?wizard=… 直接打开向导

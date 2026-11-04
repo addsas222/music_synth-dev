@@ -599,6 +599,24 @@ def check_dependencies(paths: dict, probe: dict | None = None) -> dict:
     gpu = probe.get("gpu")
     items: list[dict] = []
 
+    # 没选安装位置：不探测、不建议任何盘，必须先让用户填。
+    if not paths.get("configured"):
+        items.append(_item(
+            "install_path", "安装位置", "missing", "还没有选择安装目录",
+            required=True, installable=False,
+            fix="在下面选择或输入一个目录（插件不会自动选盘，也不会下到别的盘）"))
+        return {
+            "ok": False, "ready": False, "needs_path": True,
+            "items": items, "missing": ["install_path"],
+            "optional_missing": [], "installable_missing": [], "actions": [],
+            "total_missing_gb": 0, "suggested_root": "", "default_root": "",
+            "base_python": {"path": "", "version": "", "source": ""},
+            "hardware": probe,
+            "hardware_brief": runtime.probe_brief(probe),
+            "paths": {k: str(v) for k, v in paths.items()
+                      if isinstance(v, (str, Path)) and k not in {"raw", "host_section"}},
+        }
+
     # host runtime ---------------------------------------------------------
     host_version = sys.version.split()[0]
     host_ok = tuple(int(x) for x in host_version.split(".")[:2]) >= (3, 9)
@@ -766,6 +784,12 @@ def install(paths: dict, items: list[str] | None, progress, probe: dict | None =
     probe = probe or runtime.probe_hardware(force=True)
     gpu = probe.get("gpu")
     report = check_dependencies(paths, probe)
+    if not paths.get("configured"):
+        return {"ok": False, "error": "还没有选择安装位置；插件不会自动选盘下载",
+                "installed": [], "skipped": [],
+                "errors": [{"item": "install_path",
+                            "error": "请先选择安装位置（绝对路径）"}],
+                "missing_after": report.get("missing", []), "report": report}
     by_key = _item_map(report)
     requested = items or [i["key"] for i in report["items"]
                           if i["installable"] and i["status"] != "ready"]

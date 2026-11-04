@@ -470,9 +470,22 @@ class MusicSynthPlugin(NekoPluginBase):
     async def ms_setup_install(self, path: str = "", items=None, base_python: str = "",
                                download_source: str = "", precision: str = "", **_):
         updates: dict = {}
+        current_root = str(self._pipeline.paths.get("compute_root") or "")
         if path:
             target = Path(path).expanduser()
+            if not target.is_absolute():
+                return Ok({"ok": False,
+                           "error": "请填绝对路径，例如 D:\\NEKOMusicSynth"})
             updates["compute_root"] = str(target)
+            # 换了安装根目录：清掉旧的派生路径，避免插件还去旧盘找模型。
+            if str(target) != current_root:
+                for key in ("envs_dir", "models_dir", "work_dir", "sep_model_dir",
+                            "ddsp_root", "ddsp_ckpt", "synth_python", "sep_python",
+                            "train_runs_dir"):
+                    updates[key] = ""
+        elif not self._pipeline.paths.get("configured"):
+            return Ok({"ok": False, "needs_path": True,
+                       "error": "请先选择安装位置：插件不会自动选盘，也不会下载到别的盘"})
         if base_python:
             updates["base_python"] = base_python
         if download_source:
@@ -482,6 +495,9 @@ class MusicSynthPlugin(NekoPluginBase):
         if updates:
             runtime.save_config(self._data_dir, updates)
         paths = self._reload_paths()
+        if not paths.get("configured"):
+            return Ok({"ok": False, "needs_path": True,
+                       "error": "安装位置没有保存成功，请重新选择目录"})
         try:
             Path(paths["compute_root"]).mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -688,7 +704,15 @@ class MusicSynthPlugin(NekoPluginBase):
             updates["sep_backend"] = sep_backend
         # None = 未传（保持原值）；"" = 显式清空，回到从 compute_root 派生的默认目录。
         if compute_root is not None:
-            updates["compute_root"] = str(Path(compute_root).expanduser()) if compute_root else ""
+            new_root = str(Path(compute_root).expanduser()) if compute_root else ""
+            old_root = str(self._pipeline.paths.get("compute_root") or "")
+            updates["compute_root"] = new_root
+            # 换根目录时清掉旧的派生路径，避免还去旧盘找模型/环境。
+            if new_root and new_root != old_root:
+                for key in ("envs_dir", "models_dir", "work_dir", "sep_model_dir",
+                            "synth_python", "sep_python", "ddsp_root", "ddsp_ckpt",
+                            "train_runs_dir"):
+                    updates[key] = ""
         for key, value in (("envs_dir", envs_dir), ("models_dir", models_dir),
                            ("work_dir", work_dir), ("sep_model_dir", sep_model_dir),
                            ("base_python", base_python), ("ddsp_root", ddsp_root),
@@ -957,6 +981,8 @@ class MusicSynthPlugin(NekoPluginBase):
     def _train_ready(self) -> list:
         """Everything one real training run needs; empty list means ready."""
         problems = []
+        if not self._pipeline.paths.get("configured"):
+            return ["安装位置（还没选择）"]
         python = self._train_python()
         repo = self._train_repo()
         if not python.is_file():
@@ -3799,6 +3825,9 @@ class MusicSynthPlugin(NekoPluginBase):
                               instrumental=False, auto_sing=False,
                               inference_steps: int = 12, guidance_scale: float = 7.0,
                               seed: int = -1, **_):
+        if not self._pipeline.paths.get("configured"):
+            return Ok({"ok": False,
+                       "error": "还没有选择安装位置，请先到安装向导/设置里选一个目录"})
         problems = self._ace_problems()
         if problems:
             return Ok({"ok": False, "error": "原创生成还没就绪，缺少 " + "、".join(problems)})
@@ -3905,6 +3934,9 @@ class MusicSynthPlugin(NekoPluginBase):
                   description="把 ACE 需要的 Python 依赖装到计算根目录的 acestep\\pylibs（模型会在首次生成时自动下载）",
                   input_schema={"type": "object", "properties": {}})
     async def ms_ace_install(self, **_):
+        if not self._pipeline.paths.get("configured"):
+            return Ok({"ok": False,
+                       "error": "还没有选择安装位置，请先到安装向导/设置里选一个目录"})
         p = self._ace_paths()
         if not p["python"].is_file():
             return Ok({"ok": False, "error": f"找不到 DDSP 环境的 Python：{p['python']}"})

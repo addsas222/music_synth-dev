@@ -443,11 +443,18 @@ def resolve_paths(data_dir: Path, host_section: dict | None = None) -> dict:
         return _cfg_value(cfg, key, _cfg_value(host_section, key, ""))
 
     root_text = pick("compute_root")
+    configured = bool(root_text)
     if root_text:
         root = Path(root_text).expanduser()
     else:
+        # 不再自动挑“剩余空间最大的盘”：新用户必须先自己选安装位置。
+        # 只有已经存在的旧安装（legacy）可以直接复用，因为它不是新下载。
         legacy = legacy_install_root()
-        root = legacy or default_install_root()
+        if legacy is not None:
+            root = legacy
+            configured = True
+        else:
+            root = Path("")
 
     envs_dir = Path(pick("envs_dir") or (root / "envs"))
     models_dir = Path(pick("models_dir") or (root / "models"))
@@ -475,6 +482,7 @@ def resolve_paths(data_dir: Path, host_section: dict | None = None) -> dict:
     return {
         "config_file": cfg_path,
         "compute_root": root,
+        "configured": configured,
         "envs_dir": envs_dir,
         "models_dir": models_dir,
         "work_dir": work_dir,

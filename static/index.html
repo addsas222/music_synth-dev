@@ -4174,7 +4174,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       /* @__PURE__ */ jsx("div", { style: { fontSize: 13.5, color: INK, lineHeight: 1.8 }, children: "程序、模型和临时文件都会放在这里。选一个空间充足的盘就行，装在 D 盘、E 盘都可以。" }),
       /* @__PURE__ */ jsxs("label", { style: { display: "flex", flexDirection: "column", gap: 6, fontSize: 12, color: INK_2 }, children: [
         /* @__PURE__ */ jsx("span", { children: "安装到哪里" }),
-        /* @__PURE__ */ jsx("input", { value: path, onChange: (e) => setPath(e.target.value), style: {
+        /* @__PURE__ */ jsx("input", { value: path, placeholder: "例如 D:\\\\NEKOMusicSynth", onChange: (e) => setPath(e.target.value), style: {
           border: "1px solid " + (lack ? "#e8a3a3" : "transparent"),
           borderRadius: 12,
           padding: "10px 14px",
@@ -4184,7 +4184,8 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
           outline: "none"
         } })
       ] }),
-      /* @__PURE__ */ jsx("div", { style: { display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }, children: freeGb !== null ? lack ? /* @__PURE__ */ jsxs(StatusBadge, { tone: "error", children: [
+      /* @__PURE__ */ jsx(Muted, { children: "必须自己填一个绝对路径（例如 D:\\NEKOMusicSynth）。插件不会自动挑盘，也不会把模型下到别的盘。" }),
+      /* @__PURE__ */ jsx("div", { style: { display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }, children: !path.trim() ? /* @__PURE__ */ jsx(StatusBadge, { tone: "warning", children: "请先填写安装目录，否则不会开始下载" }) : freeGb !== null ? lack ? /* @__PURE__ */ jsxs(StatusBadge, { tone: "error", children: [
         "这个盘只剩 ",
         freeGb.toFixed(1),
         " GB，还要约 ",
@@ -4383,7 +4384,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     }, []);
     const hostState = props.state;
     const view = snap || (hostState && typeof hostState === "object" ? hostState : null);
-    const setupReady = !view || !view.setup || view.setup.completed !== false;
+    const setupReady = !view || !view.setup || view.setup.completed === true;
     useEffect(() => {
       if (!setupReady) setWizard(true);
       else if (wizardStartAt()) setWizard(true);
