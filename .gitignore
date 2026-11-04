@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 本地备份 / 调试
+*.bak*
+*_bak*
+_dbg*
+_trash/
+claude-backups/
+NEKO_PLUGIN_BACKUPS/
+_backup*/
+
+# 开发预览音频（几百 MB，不入库）
+static/_preview/
+
+# 锁文件
+*.lock
+
+# 本机生成物
+dist/

@@ -1,0 +1,649 @@
+"""Job orchestration and the on-disk track database for 为她而唱.
+
+The pipeline is deliberately boring: every step is a separate worker process in
+its own Python environment, every step writes its artifacts to disk, and the
+track record only advances when the step really produced its output. A failed
+step keeps the artifacts of the steps that did succeed.
+
+Voice-conversion flow (DDSP-SVC 6.3): separate the vocals from the original
+accompaniment, re-voice the dry vocal with DDSP-SVC, then mix the converted
+vocal back into the instrumental and write the final take.
+"""
+from __future__ import annotations
+
+import json
+import math
+import os
+import re
+import shutil
+import threading
+import time
+import traceback
+import uuid
+from pathlib import Path
+
+from . import runtime
+
+STEP_ORDER = ("separate", "convert", "mix")
+
+
+def _now() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _trim_plan(plan: dict) -> dict:
+    """Plan snapshot for logs/state without the nested probe duplicate."""
+    return {k: v for k, v in plan.items() if k != "probe"}
+
+
+def _slug(text: str, fallback: str = "song") -> str:
+    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", str(text or ""))[:60].strip()
+    return text or fallback
+
+
+class TrackStore:
+    """JSON-file track database, safe for the plugin's worker thread."""
+
+    def __init__(self, data_dir: Path):
+        self.path = Path(data_dir) / "tracks.json"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        self._tracks: list[dict] = []
+        self._loaded = False
+
+    def _load(self) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                data = data.get("tracks") or []
+            if isinstance(data, list):
+                self._tracks = [t for t in data if isinstance(t, dict)]
+        except (OSError, ValueError):
+            self._tracks = []
+
+    def _flush(self) -> None:
+        tmp = self.path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"tracks": self._tracks}, ensure_ascii=False, indent=2),
+                       encoding="utf-8")
+        os.replace(tmp, self.path)
+
+    def all(self) -> list[dict]:
+        with self._lock:
+            self._load()
+            return [dict(t) for t in self._tracks]
+
+    def get(self, track_id: str) -> dict | None:
+        with self._lock:
+            self._load()
+            for t in self._tracks:
+                if t.get("id") == track_id:
+                    return dict(t)
+            return None
+
+    def add(self, **fields) -> dict:
+        with self._lock:
+            self._load()
+            track = {
+                "id": uuid.uuid4().hex[:12],
+                "title": fields.get("title") or "未命名歌曲",
+                "artist": fields.get("artist") or "",
+                "source": fields.get("source") or "",
+                "start_s": fields.get("start_s"),
+                "end_s": fields.get("end_s"),
+                "duration_s": fields.get("duration_s"),
+                "status": "pending",
+                "step": "waiting",
+                "progress": 0,
+                "steps": {},
+                "artifacts": {},
+                "notes_count": 0,
+                "lyrics_preview": [],
+                "timbre_source": "",
+                "plan": {},
+                "error": "",
+                "created_at": _now(),
+                "updated_at": _now(),
+            }
+            self._tracks.append(track)
+            self._flush()
+            return dict(track)
+
+    def update(self, track_id: str, **fields) -> dict | None:
+        with self._lock:
+            self._load()
+            for t in self._tracks:
+                if t.get("id") != track_id:
+                    continue
+                for key, value in fields.items():
+                    if key in {"steps", "artifacts"} and isinstance(value, dict):
+                        t.setdefault(key, {}).update(value)
+                    else:
+                        t[key] = value
+                t["updated_at"] = _now()
+                self._flush()
+                return dict(t)
+            return None
+
+    def remove(self, track_id: str) -> bool:
+        with self._lock:
+            self._load()
+            before = len(self._tracks)
+            self._tracks = [t for t in self._tracks if t.get("id") != track_id]
+            if len(self._tracks) != before:
+                self._flush()
+                return True
+            return False
+
+
+class _TrackCancelled(Exception):
+    """用户在处理中要求删除，流水线在阶段边界停止。"""
+
+
+class Pipeline:
+    def __init__(self, data_dir: Path, plugin_dir: Path):
+        self.data_dir = Path(data_dir)
+        self.plugin_dir = Path(plugin_dir)
+        self.workers = self.plugin_dir / "workers"
+        self.store = TrackStore(self.data_dir)
+        self.paths = runtime.resolve_paths(self.data_dir)
+        self.work_dir = Path(self.paths["work_dir"])
+        self.work_dir.mkdir(parents=True, exist_ok=True)
+        self.log_path = self.data_dir / "pipeline.log"
+        self._run_lock = threading.Lock()
+        self._busy: set[str] = set()
+        # 用户在处理中点了删除：置取消标记，流水线在阶段边界停下来再真删
+        self._cancelled: set[str] = set()
+        self._pending_delete: dict[str, bool] = {}
+        self.last_probe: dict = {}
+        self.last_plan: dict = {}
+        self.last_probe_at = ""
+
+    # ---------------- helpers ----------------
+    def _log(self, message: str) -> None:
+        line = f"{_now()} {message}\n"
+        try:
+            with self.log_path.open("a", encoding="utf-8") as fh:
+                fh.write(line)
+        except OSError:
+            pass
+
+    def _track_dir(self, track_id: str) -> Path:
+        d = self.work_dir / "tracks" / track_id
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def log_probe(self, probe: dict, plan: dict) -> None:
+        """Persist one hardware probe + the plan derived from it."""
+        self._log("PROBE " + json.dumps(probe, ensure_ascii=False))
+        self._log("PLAN " + json.dumps(_trim_plan(plan), ensure_ascii=False))
+
+    def _set(self, track_id: str, **fields) -> None:
+        self.store.update(track_id, **fields)
+
+    def _step(self, track_id: str, name: str, state: str, **extra) -> None:
+        self.store.update(track_id, step=name, steps={name: {"state": state, "at": _now(), **extra}})
+
+    @staticmethod
+    def _plan_snapshot(plan: dict) -> dict:
+        keys = ("tier", "label", "basis", "device", "sep_device", "synth_precision",
+                "synth_n_steps", "max_segment_s", "parallel", "sep_step",
+                "vram_total_gib", "vram_free_gib", "vram_used_gib",
+                "ram_available_gib", "gpu_name", "compute_cap", "warnings")
+        return {k: plan.get(k) for k in keys if k in plan}
+
+    # ---------------- step runners ----------------
+    def _run_attempts(self, python, script: Path, job: dict, out_dir: Path,
+                      timeout: float, attempts: list[dict], label: str) -> dict:
+        """Run a worker with explicit degradation attempts; retry only on OOM."""
+        last: dict = {"ok": False, "error": "未执行"}
+        for index, attempt in enumerate(attempts, 1):
+            merged = dict(job)
+            merged.update(attempt.get("job") or {})
+            note = attempt.get("note") or f"第 {index} 次"
+            self._log(f"{label}: {note}")
+            try:
+                result = runtime.run_worker(
+                    python, script, merged, cwd=out_dir, timeout=timeout,
+                    log_path=self.log_path, env_extra=attempt.get("env"))
+            except Exception as exc:  # noqa: BLE001 - report, then try next
+                result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            if result.get("ok"):
+                result.setdefault("attempts", index)
+                return result
+            last = result
+            if not runtime.is_oom(result):
+                return result
+            self._log(f"{label}: 检测到显存不足，自动降级（{note}）")
+        if runtime.is_oom(last):
+            last["oom"] = True
+            last["advice"] = runtime.oom_advice(getattr(self, "last_plan", {}) or {})
+        return last
+
+    # ------------------------------------------------------------------
+    # voice conversion (DDSP-SVC 6.3): re-voice the separated dry vocal
+    # ------------------------------------------------------------------
+    def _convert(self, track_id: str, out_dir: Path, vocals: str, plan: dict, key: int | None = None) -> dict:
+        """Step 2: run the DDSP-SVC RectifiedFlow model over the dry vocal.
+
+        The DDSP environment's own Python drives the repo entry script
+        (``main_reflow.py``) with ``cwd=repo root`` because the vocoder loads
+        ``pretrain/rmvpe/model.pt`` by a relative path.  The job carries only
+        the keys ``ddsp_worker.main()`` consumes, so a stray key can never
+        reach the subprocess.
+        """
+        repo = Path(str(self.paths.get("ddsp_root") or ""))
+        python = Path(self.paths["synth_python"])
+        ckpt = Path(str(self.paths.get("ddsp_ckpt") or ""))
+        problems = []
+        if not python.is_file():
+            problems.append(f"DDSP 环境 {python}")
+        if not (repo / "main_reflow.py").is_file():
+            problems.append(f"DDSP 仓库 {repo}")
+        if not ckpt.is_file():
+            problems.append(f"训练好的模型 {ckpt}")
+        if problems:
+            message = ("缺少 " + "、".join(problems)
+                       + "；请先打开「首次使用向导」训练 DDSP-SVC 模型")
+            self._step(track_id, "convert", "failed", error=message)
+            self._set(track_id, status="failed", progress=60, error=message)
+            return {"ok": False, "step": "convert", "error": message}
+
+        device = str(plan.get("device") or "cuda")
+        self._step(track_id, "convert", "running", device=device, engine="ddsp",
+                   model=ckpt.name)
+        raw = self.paths.get("raw") or {}
+        job = {
+            "repo": str(repo),
+            "python": str(python),
+            "model_ckpt": str(ckpt),
+            "input": str(vocals),
+            "out_dir": str(out_dir / "convert"),
+            "key": int(self.paths.get("key_shift") or 0) if key is None else int(key),
+            "vocal_register_shift": int(self.paths.get("vocal_register_shift") or 0),
+            "infer_step": int(self.paths.get("infer_step") or 80),
+            "method": str(raw.get("method") or "euler"),
+            "pitch_extractor": str(raw.get("pitch_extractor") or "rmvpe"),
+            "device": device,
+            "f0_min": int(raw.get("f0_min") or 65),
+            "f0_max": int(raw.get("f0_max") or 800),
+            "threshold": int(raw.get("threshold") or -60),
+            "timeout": 7200,
+        }
+        result = runtime.run_worker(
+            python, self.workers / "ddsp_worker.py", job,
+            cwd=out_dir, timeout=7200, log_path=self.log_path)
+        if not result.get("ok"):
+            self._step(track_id, "convert", "failed", error=result.get("error"))
+            self._set(track_id, status="failed", progress=60,
+                      error=result.get("error") or "变声失败")
+            return {"ok": False, "step": "convert", "error": result.get("error"),
+                    "detail": result}
+        self._step(track_id, "convert", "done", engine="ddsp", model=ckpt.name,
+                   key=job["key"], infer_step=job["infer_step"],
+                   duration_s=result.get("duration_s"), peak=result.get("peak"),
+                   rms=result.get("rms"))
+        self._set(track_id, progress=75,
+                  artifacts={"vocal_wav": result.get("wav", "")})
+        self._log(f"[{track_id}] convert: {ckpt.name} key={job['key']} "
+                  f"step={job['infer_step']} {result.get('duration_s')}s "
+                  f"peak={result.get('peak')} rms={result.get('rms')}")
+        return result
+
+    # 开唱前的人声清理链：和训练素材的处理保持一致（去混响 → 去噪）。
+    _CLEAN_MODELS = [
+        ("dereverb", "dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt", "noreverb"),
+        ("denoise", "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt", "dry"),
+    ]
+
+    def _clean_vocal(self, track_id: str, out_dir: Path, vocals: str, plan: dict) -> dict:
+        """把分离出来的人声做去混响 + 去噪，让它和训练素材同分布。
+
+        训练语料走的就是这两步；开唱时若直接用分离结果，混响/残留会让 f0 抖动，
+        DDSP 的输出就会发飘、发金属（用户说的「电音感」）。
+        """
+        python = Path(self.paths["sep_python"])
+        if not python.is_file() or not vocals:
+            return {"ok": False, "error": "分离环境未就绪"}
+        cur = vocals
+        for name, model, stem in self._CLEAN_MODELS:
+            self._step(track_id, "clean", "running", stage=name)
+            stage_dir = out_dir / "clean" / name
+            job = {
+                "input": cur,
+                "out_dir": str(stage_dir),
+                "backend": "audio_separator",
+                "model": model,
+                "model_dir": str(self.paths.get("sep_model_dir") or (self.work_dir / "models")),
+                "device": plan.get("sep_device", "cuda:0"),
+                "use_cuda": plan.get("sep_device", "cuda:0") != "cpu",
+                "use_autocast": plan.get("sep_device", "cuda:0") != "cpu",
+            }
+            attempts = [{"job": job, "note": f"设备 {job['device']}"}]
+            if job["device"] != "cpu":
+                attempts.append({
+                    "job": {"device": "cpu", "use_cuda": False, "use_autocast": False},
+                    "env": {"CUDA_VISIBLE_DEVICES": "-1"},
+                    "note": "GPU 失败，改走 CPU",
+                })
+            res = self._run_attempts(python, self.workers / "separate_worker.py", job,
+                                     stage_dir, 3600, attempts, f"[{track_id}] {name}")
+            if not res.get("ok"):
+                return {"ok": False, "step": name, "error": res.get("error") or f"{name} 失败"}
+            stems = res.get("stems") or {}
+            nxt = stems.get(stem) or res.get("target_stem") or ""
+            if not nxt or not Path(str(nxt)).is_file():
+                return {"ok": False, "step": name, "error": f"{name} 未产出 {stem} 轨"}
+            cur = str(nxt)
+            self._log(f"[{track_id}] clean/{name} -> {cur}")
+        return {"ok": True, "wav": cur}
+
+    def _ref_f0_hz(self) -> float:
+        """训练语料的参考音高（合格切片 f0 中位数的中位数）；拿不到返回 0。"""
+        try:
+            index_path = Path(str(self.paths.get("compute_root") or "")) / "corpus" / "index.json"
+            data = json.loads(index_path.read_text(encoding="utf-8"))
+            vals = []
+            for src in data.get("sources", []):
+                for clip in src.get("clips", []):
+                    if clip.get("status") == "ok" and clip.get("f0_hz_median"):
+                        vals.append(float(clip["f0_hz_median"]))
+            if not vals:
+                return 0.0
+            vals.sort()
+            return float(vals[len(vals) // 2])
+        except Exception:  # noqa: BLE001
+            return 0.0
+
+    def _auto_key(self, track_id: str, vocal_wav: str, plan: dict) -> int:
+        """按「源人声音高 / 训练语料音高」算半音差，把嗓音挪到模型熟悉的音域。
+
+        返回交给 main_reflow 的 -k 值；伴奏会在混音时同向移调，成品仍保持原调关系。
+        """
+        raw = self.paths.get("raw") or {}
+        if not bool(raw.get("auto_key", True)):
+            return 0
+        python = Path(self.paths["sep_python"])
+        if not python.is_file() or not vocal_wav:
+            return 0
+        ref = float(raw.get("ref_f0") or 0) or self._ref_f0_hz()
+        if ref <= 0:
+            return 0
+        probe = runtime.run_worker(python, self.workers / "f0_worker.py",
+                                   {"input": str(vocal_wav)}, cwd=self.work_dir,
+                                   timeout=600, log_path=self.log_path)
+        if not probe.get("ok"):
+            self._log(f"[{track_id}] auto-key 跳过：{probe.get('error')}")
+            return 0
+        med = float(probe.get("median_hz") or 0)
+        if med <= 0:
+            return 0
+        shift = int(round(12.0 * math.log2(ref / med)))
+        cap = int(raw.get("auto_key_max") or 4)   # 移调太大，伴奏的相位声码器会明显失真
+        shift = max(-cap, min(cap, shift))
+        if abs(shift) < 2:
+            shift = 0
+        self._log(f"[{track_id}] auto-key: 源 {med:.0f}Hz / 训练参考 {ref:.0f}Hz "
+                  f"→ {shift:+d} 半音 (voiced={probe.get('voiced_ratio')})")
+        self._step(track_id, "key", "done", source_f0=med, ref_f0=ref, shift=shift)
+        return shift
+
+    def _separate(self, track: dict, out_dir: Path, plan: dict) -> dict:
+        backend = self.paths.get("sep_backend") or "bs_roformer"
+        model = plan.get("sep_model") or "mel_band_roformer_karaoke_becruily.ckpt"
+        if self.paths.get("sep_backend") == "demucs":
+            model = "htdemucs"
+        job = {
+            "input": track["source"],
+            "out_dir": str(out_dir / "separate"),
+            "backend": "demucs" if backend == "demucs" else "audio_separator",
+            "model": model,
+            "model_dir": str(self.paths.get("sep_model_dir") or (self.work_dir / "models")),
+            "device": plan.get("sep_device", "cuda:0"),
+            "use_cuda": plan.get("sep_device", "cuda:0") != "cpu",
+            "use_autocast": plan.get("sep_device", "cuda:0") != "cpu",
+            "sep_step": int(plan.get("sep_step") or 4),
+        }
+        python = Path(self.paths["sep_python"])
+        if not Path(python).is_file():
+            return {"ok": False, "step": "separate",
+                    "error": f"分离环境未安装（缺少 {python}）；请先运行首次使用向导 ms_setup_install"}
+        attempts = [{"job": job, "note": f"设备 {job['device']}"}]
+        if job["device"] != "cpu":
+            attempts.append({
+                "job": {"device": "cpu", "use_cuda": False, "use_autocast": False},
+                "env": {"CUDA_VISIBLE_DEVICES": "-1"},
+                "note": "GPU 失败，改走 CPU 分离",
+            })
+        return self._run_attempts(python, self.workers / "separate_worker.py", job,
+                                  out_dir, 3600, attempts, f"[{track.get('id')}] 分离")
+
+    # ---------------- full track ----------------
+    def _trash_path(self, path: Path) -> None:
+        """移到回收站（和插件里 _trash_move 同一个目录），不直接删。"""
+        path = Path(path)
+        if not path.exists():
+            return
+        root = Path(str(self.paths.get("compute_root") or self.work_dir)) / "_trash_20261103"
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            dest = root / f"{int(time.time() * 1000)}_{path.name}"
+            shutil.move(str(path), str(dest))
+        except OSError:
+            pass
+
+    def request_cancel(self, track_id: str, delete_files: bool) -> bool:
+        """处理中的曲目要删除：先登记，流水线在下一个阶段边界收尾并删除。"""
+        with self._run_lock:
+            if track_id not in self._busy:
+                return False
+            self._cancelled.add(track_id)
+            self._pending_delete[track_id] = bool(delete_files)
+        self._log(f"[{track_id}] 收到取消请求（delete_files={bool(delete_files)}）")
+        return True
+
+    def process_track(self, track_id: str, plan: dict | None = None) -> dict:
+        with self._run_lock:
+            if track_id in self._busy:
+                return {"ok": False, "error": "该曲目正在处理中"}
+            self._busy.add(track_id)
+        return self._process_track_body(track_id, plan)
+
+    def _process_track_body(self, track_id: str, plan: dict | None = None) -> dict:
+        try:
+            track = self.store.get(track_id)
+            if not track:
+                return {"ok": False, "error": "曲目不存在"}
+            # Probe again for *this* track: free VRAM changes between songs.
+            probe = runtime.probe_hardware(force=True)
+            plan = runtime.plan_for(
+                probe,
+                self.paths.get("tier_override", ""),
+                self.paths.get("precision", "auto"),
+                self.paths.get("max_parallel", 0),
+            )
+            self.last_probe = probe
+            self.last_plan = plan
+            self.last_probe_at = _now()
+            self._log(f"[{track_id}] PROBE " + json.dumps(probe, ensure_ascii=False))
+            self._log(f"[{track_id}] PLAN " + json.dumps(_trim_plan(plan), ensure_ascii=False))
+            out_dir = self._track_dir(track_id)
+            self._set(track_id, status="running", progress=5, error="",
+                      plan=self._plan_snapshot(plan))
+            self._log(f"[{track_id}] start: {track['title']} ({track['source']})")
+
+            # 1) separation -------------------------------------------------
+            self._step(track_id, "separate", "running", device=plan.get("sep_device"))
+            sep = self._separate(track, out_dir, plan)
+            if not sep.get("ok"):
+                self._step(track_id, "separate", "failed", error=sep.get("error"))
+                self._set(track_id, status="failed", error=sep.get("error") or "分离失败",
+                          progress=10)
+                return {"ok": False, "step": "separate", "error": sep.get("error"),
+                        "detail": sep}
+            vocals = sep.get("vocals") or ""
+            instrumental = sep.get("instrumental") or ""
+            self._step(track_id, "separate", "done", engine=sep.get("engine"), model=sep.get("model"))
+            if track_id in self._cancelled:
+                raise _TrackCancelled()
+            self._set(track_id, progress=30,
+                      artifacts={"vocals": vocals, "instrumental": instrumental,
+                                 "separate_files": sep.get("files", [])})
+
+            # 1.5) 人声清理（去混响 → 去噪），和训练素材对齐 ---------------
+            self._step(track_id, "clean", "running")
+            cleaned = self._clean_vocal(track_id, out_dir, vocals, plan)
+            if cleaned.get("ok"):
+                vocal_input = cleaned.get("wav") or vocals
+                self._step(track_id, "clean", "done", wav=vocal_input)
+            else:
+                vocal_input = vocals
+                self._step(track_id, "clean", "skipped", error=cleaned.get("error"))
+                self._log(f"[{track_id}] 清理失败，直接用分离结果：{cleaned.get('error')}")
+            self._set(track_id, progress=45, artifacts={"vocal_clean": vocal_input})
+
+            # 1.55) 混响跟随原曲：用原始分离人声估计原曲人声的混响量 --------
+            reverb_raw = self.paths.get("raw") or {}
+            auto_reverb = bool(reverb_raw.get("reverb_auto", True))
+            try:
+                auto_strength = float(reverb_raw.get("reverb_auto_strength", 1.0) or 1.0)
+            except (TypeError, ValueError):
+                auto_strength = 1.0
+            auto_strength = max(0.0, min(1.0, auto_strength))
+            estimated_wet = None
+            if auto_reverb:
+                est = runtime.run_worker(
+                    Path(self.paths["synth_python"]), self.workers / "reverb_worker.py",
+                    {"input": str(vocals)}, cwd=self.work_dir, timeout=600,
+                    log_path=self.log_path)
+                if est.get("ok") and est.get("wet") is not None:
+                    estimated_wet = float(est["wet"])
+                    self._step(track_id, "reverb", "done", cpp=est.get("cpp"),
+                               wet=round(estimated_wet, 3), strength=auto_strength)
+                    self._log(f"[{track_id}] 混响估计：CPP={est.get('cpp')} "
+                              f"wet={estimated_wet:.3f}")
+                else:
+                    self._log(f"[{track_id}] 混响估计跳过："
+                              f"{est.get('error') or est.get('note')}")
+
+            if track_id in self._cancelled:
+                raise _TrackCancelled()
+            # 1.6) 自动配调：把嗓音挪到模型熟悉的音域 ---------------------
+            key_shift = self._auto_key(track_id, vocal_input, plan)
+
+            # 2) voice conversion (DDSP-SVC) ---------------------------------
+            self._step(track_id, "convert", "running", device=plan.get("device"))
+            convert = self._convert(track_id, out_dir, vocal_input, plan, key=key_shift)
+            if not convert.get("ok"):
+                self._step(track_id, "convert", "failed", error=convert.get("error"))
+                self._set(track_id, status="failed", progress=60,
+                          error=convert.get("error") or "变声失败")
+                return {"ok": False, "step": "convert", "error": convert.get("error"),
+                        "detail": convert}
+            converted_vocal = convert.get("wav") or ""
+            self._set(track_id, progress=75,
+                      artifacts={"vocal_wav": converted_vocal,
+                                 "vocal_source": vocals})
+
+            if track_id in self._cancelled:
+                raise _TrackCancelled()
+            # 3) mix ----------------------------------------------------------
+            self._step(track_id, "mix", "running")
+            if estimated_wet is not None and auto_reverb:
+                vocal_reverb = max(0.0, min(0.6, estimated_wet * auto_strength))
+            else:
+                vocal_reverb = float(reverb_raw.get("vocal_reverb", 0.12))
+            mix = runtime.run_worker(
+                Path(self.paths["synth_python"]), self.workers / "mix_worker.py",
+                {"vocal": converted_vocal, "instrumental": instrumental,
+                 "out_dir": str(out_dir / "final"),
+                 # 人声被移了 key 半音，伴奏同向移同样多，成品保持原调
+                 "accompaniment_shift": -int(key_shift),
+                 # 伴奏加宽 >1 能更宽，但会削薄中间声部；默认 1.0 保持原样
+                 "stereo_width": float((self.paths.get("raw") or {}).get("stereo_width") or 1.0),
+                 "vocal_reverb": vocal_reverb,
+                 # 人声清晰度/电平与伴奏音量（高级设置）
+                 "clarity": float((self.paths.get("raw") or {}).get("clarity", 1.0)),
+                 "vocal_level_db": float((self.paths.get("raw") or {}).get("vocal_level_db", -2.0)),
+                 "bgm_gain_db": float((self.paths.get("raw") or {}).get("bgm_gain_db", 0.0)),
+                 # 咬字增强用原始分离人声（去噪前）的高频，补回辅音
+                 "reference_vocal": str(vocals),
+                 "consonant": float((self.paths.get("raw") or {}).get("consonant", 0.35))},
+                cwd=out_dir, timeout=900, log_path=self.log_path,
+            )
+            if not mix.get("ok"):
+                self._step(track_id, "mix", "failed", error=mix.get("error"))
+                self._set(track_id, status="failed", progress=95,
+                          error=mix.get("error") or "混音失败")
+                return {"ok": False, "step": "mix", "error": mix.get("error"),
+                        "detail": mix}
+            self._step(track_id, "mix", "done", engine="ddsp")
+            self._set(track_id, status="done", progress=100, error="",
+                      artifacts={"final": mix.get("final", ""),
+                                 "vocal_mixed": mix.get("vocal_only", "")})
+            self._log(f"[{track_id}] done: {mix.get('final')}")
+            return {"ok": True, "track": self.store.get(track_id), "detail": mix}
+        except _TrackCancelled:
+            with self._run_lock:
+                pending = self._pending_delete.pop(track_id, None)
+            self._log(f"[{track_id}] 已按用户要求取消"
+                      f"（{'删除文件' if pending else '保留文件'}）")
+            if pending is not None:
+                track_now = self.store.get(track_id) or {}
+                if pending:
+                    for value in (track_now.get("artifacts") or {}).values():
+                        try:
+                            if value:
+                                self._trash_path(Path(str(value)))
+                        except Exception:  # noqa: BLE001
+                            pass
+                    try:
+                        self._trash_path(self.work_dir / "tracks" / str(track_id))
+                    except Exception:  # noqa: BLE001
+                        pass
+                self.store.remove(track_id)
+            else:
+                self._set(track_id, status="cancelled", progress=0, error="用户取消了这一首")
+            return {"ok": False, "cancelled": True,
+                    "deleted": pending is not None}
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"[{track_id}] crashed: {type(exc).__name__}: {exc}")
+            self._log(f"[{track_id}] traceback:\n{traceback.format_exc().rstrip()}")
+
+
+            self._set(track_id, status="failed", error=f"{type(exc).__name__}: {exc}")
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        finally:
+            with self._run_lock:
+                self._busy.discard(track_id)
+                self._cancelled.discard(track_id)
+                self._pending_delete.pop(track_id, None)
+
+    # ---------------- recording ----------------
+    # ---------------- splitting ----------------
+    def split_recording(self, wav_path: Path, *, min_song_s: float = 25.0,
+                        silence_s: float = 2.0,
+                        title_marks: list[dict] | None = None) -> dict:
+        out_dir = self.work_dir / "splits" / time.strftime("%Y%m%d_%H%M%S")
+        job = {"input": str(wav_path), "out_dir": str(out_dir),
+               "min_song_s": min_song_s, "silence_s": silence_s,
+               "title_marks": title_marks or []}
+        result = runtime.run_worker(Path(self.paths["synth_python"]),
+                                    self.workers / "split_worker.py", job,
+                                    cwd=self.work_dir, timeout=600,
+                                    log_path=self.log_path)
+        if result.get("ok"):
+            result["tracks"] = [
+                dict(item, track_id=self.store.add(
+                    title=item.get("title") or f"歌曲 {item['index']}",
+                    artist=item.get("artist") or "",
+                    source=item.get("path"),
+                    start_s=item.get("start_s"),
+                    end_s=item.get("end_s"),
+                    duration_s=item.get("duration_s"),
+                )["id"])
+                for item in result.get("tracks", [])
+            ]
+        return result

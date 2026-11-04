@@ -1,0 +1,11 @@
+ACE-Step (vendored runtime)
+===========================
+
+This directory contains a vendored copy of ACE-Step v1.5 used for local
+text-to-music generation.
+
+Upstream project: https://github.com/ace-step/ACE-Step
+License: Apache License 2.0
+
+The model weights (checkpoints/) are NOT part of this plugin package; they are
+downloaded or copied separately into the compute root at runtime.
