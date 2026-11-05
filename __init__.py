@@ -2647,7 +2647,7 @@ class MusicSynthPlugin(NekoPluginBase):
     def _trash_write_manifest(self, manifest: dict) -> None:
         runtime._atomic_write(self._trash_manifest_path(), manifest)
 
-    def _trash_move(self, path: Path) -> dict:
+    def _trash_move(self, path: Path, hash_file: bool = True) -> dict:
         """Move ``path`` into the trash, recording size + sha256 in the manifest."""
         path = Path(path)
         if not path.exists():
@@ -2658,19 +2658,20 @@ class MusicSynthPlugin(NekoPluginBase):
         except OSError:
             size = 0
         digest = ""
-        try:
-            import hashlib
-            # 分块读，不把整首歌一次性读进内存（原来 read_bytes() 一删大文件就卡住事件循环）
-            h = hashlib.sha256()
-            with open(path, "rb") as fh:
-                while True:
-                    chunk = fh.read(8 * 1024 * 1024)
-                    if not chunk:
-                        break
-                    h.update(chunk)
-            digest = h.hexdigest()
-        except OSError:
-            digest = ""
+        if hash_file:
+            try:
+                import hashlib
+                # 分块读，不把整首歌一次性读进内存（原来 read_bytes() 一删大文件就卡住事件循环）
+                h = hashlib.sha256()
+                with open(path, "rb") as fh:
+                    while True:
+                        chunk = fh.read(8 * 1024 * 1024)
+                        if not chunk:
+                            break
+                        h.update(chunk)
+                digest = h.hexdigest()
+            except OSError:
+                digest = ""
         target = self._trash_dir() / f"{int(time.time() * 1000)}_{path.name}"
         try:
             shutil.move(str(path), str(target))
@@ -3529,65 +3530,118 @@ class MusicSynthPlugin(NekoPluginBase):
         return cache
 
     def _corpus_remove_source(self, source_id: str):
-        with self._corpus_lock:
-            return self._corpus_remove_source_locked(source_id)
+        return self._corpus_remove_sources([str(source_id or "")])
 
-    def _corpus_remove_source_locked(self, source_id: str):
-        """把一个素材源（原文件 + 它的切片）移入回收站并从索引里摘掉。"""
-        if str(source_id) == str(getattr(self, "_corpus_active_source", "")):
-            return Ok({"ok": False,
-                       "error": "这个素材正在处理，等它处理完再删（可以先用「隐藏」）"})
-        # 还在队列里等着的这条素材直接撤掉，别让它在后台白跑
+    def _corpus_remove_sources(self, source_ids=None, slot: str = "",
+                               all_in_slot: bool = False):
+        """批量删除素材源：索引只读写一次，文件搬移/哈希在锁外做。
+
+        单条删除也走这里；正在处理的那一条会跳过并单独提示。
+        """
+        wanted = {str(x) for x in (source_ids or []) if str(x)}
+        with self._corpus_lock:
+            index = self._corpus_index()
+            targets, skipped_active = [], []
+            for src in index.get("sources", []):
+                sid = str(src.get("id") or "")
+                if not sid:
+                    continue
+                if all_in_slot:
+                    if slot and str(src.get("slot") or "") != slot:
+                        continue
+                elif sid not in wanted:
+                    continue
+                if sid == str(getattr(self, "_corpus_active_source", "")):
+                    skipped_active.append(sid)
+                    continue
+                targets.append(dict(src))
+        if not targets:
+            return Ok({"ok": not skipped_active, "removed": [], "moved": 0,
+                       "skipped_active": skipped_active,
+                       "errors": [], "error": ("正在处理，稍后再删" if skipped_active else "没有可删除的素材")})
+        # 从排队里撤掉（不占索引锁）
+        ids = {str(t.get("id")) for t in targets}
         try:
             with self._corpus_queue_lock:
-                self._corpus_queue = [it for it in self._corpus_queue if str(it[2]) != str(source_id)]
+                self._corpus_queue = [it for it in self._corpus_queue if str(it[2]) not in ids]
         except Exception:  # noqa: BLE001
             pass
-        index = self._corpus_index()
-        target = self._corpus_find_source(index, source_id)
-        if target is None:
-            return Ok({"ok": False, "error": f"找不到素材源 {source_id!r}"})
-        moved, errors, preview_keys = [], [], []
-        for f in target.get("files", []):
-            p = Path(str(f.get("path") or ""))
-            if p.is_file():
+        # 批量时跳过大文件哈希，否则删几十个会一直读盘
+        hash_files = len(targets) <= 3
+        moved_total = 0
+        removed, errors = [], []
+        for src in targets:
+            sid = str(src.get("id") or "")
+            src_moved, src_errors = 0, []
+            preview_keys = []
+            for f in src.get("files", []):
+                p = Path(str(f.get("path") or ""))
+                if not p.is_file():
+                    continue
                 try:
                     preview_keys.append(self._preview_key(p))
                 except OSError:
                     pass
-                r = self._trash_move(p)
-                (moved if r.get("moved") else errors).append(r)
-        for c in target.get("clips", []):
-            if c.get("path"):
-                r = self._trash_move(Path(str(c["path"])))
-                (moved if r.get("moved") else errors).append(r)
-        # 试听缓存是硬链接：源文件进回收站后，链接会把数据继续留在盘上，这里一起清掉。
-        try:
-            cache = self._plugin_dir / "static" / "_preview"
-            for key in preview_keys:
-                for old in cache.glob(key + "*"):
-                    try:
-                        old.unlink()
-                    except OSError:
-                        pass
-        except OSError:
-            pass
-        if errors and not moved:
-            # 一个都没搬走：多半是文件被占用；保留索引，让用户可以重试。
-            return Ok({"ok": False,
-                       "error": "文件正在被占用，暂时删不掉，稍后再试",
-                       "errors": errors})
-        index["sources"] = [s for s in index.get("sources", []) if s.get("id") != source_id]
-        self._orphans_cache = None
-        self._corpus_write_index(index)
-        return Ok({"ok": True, "source_id": source_id, "moved": len(moved),
-                   "errors": errors})
+                r = self._trash_move(p, hash_file=hash_files)
+                if r.get("moved"):
+                    src_moved += 1
+                else:
+                    src_errors.append(r)
+            for c in src.get("clips", []):
+                if c.get("path"):
+                    r = self._trash_move(Path(str(c["path"])), hash_file=False)
+                    if r.get("moved"):
+                        src_moved += 1
+                    else:
+                        src_errors.append(r)
+            # 试听缓存是硬链接，源文件进回收站后一起清掉
+            try:
+                cache = self._plugin_dir / "static" / "_preview"
+                for key in preview_keys:
+                    for old in cache.glob(key + "*"):
+                        try:
+                            old.unlink()
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+            if src_moved:
+                removed.append(sid)
+                moved_total += src_moved
+            if src_errors:
+                errors.extend(src_errors)
+        if removed:
+            with self._corpus_lock:
+                index = self._corpus_index()
+                drop = set(removed)
+                index["sources"] = [s for s in index.get("sources", [])
+                                    if str(s.get("id")) not in drop]
+                self._corpus_write_index(index)
+            self._orphans_cache = None
+        return Ok({"ok": bool(removed) or not errors,
+                   "removed": removed, "moved": moved_total,
+                   "skipped_active": skipped_active,
+                   "errors": errors[:20],
+                   "error": ("文件正在被占用，暂时删不掉" if errors and not removed else "")})
 
     @plugin_entry(id="ms_corpus_remove", name="为她而唱 · 移除素材源",
                   description="把某个 source_id 的原始音频/切片移入回收站并记录清单",
                   input_schema={"type": "object", "properties": {"source_id": {"type": "string"}}})
     async def ms_corpus_remove(self, source_id: str = "", **_):
         return await asyncio.to_thread(self._corpus_remove_source, str(source_id or ""))
+
+    @plugin_entry(id="ms_corpus_delete_sources", name="为她而唱 · 批量删除素材",
+                  description="按 source_ids 批量删除，或传 all=true + slot 清空某一类素材；都移到回收站",
+                  input_schema={"type": "object", "properties": {
+                      "source_ids": {"type": "array", "items": {"type": "string"}},
+                      "slot": {"type": "string", "enum": ["song", "dry_sing", "speech"]},
+                      "all": {"type": "boolean"}}})
+    async def ms_corpus_delete_sources(self, source_ids=None, slot: str = "", all=False, **_):
+        ids = [str(x) for x in source_ids] if isinstance(source_ids, (list, tuple)) else []
+        if not ids and not _as_bool(all):
+            return Ok({"ok": False, "error": "没有选择要删除的素材"})
+        return await asyncio.to_thread(
+            self._corpus_remove_sources, ids, str(slot or ""), _as_bool(all))
 
     @plugin_entry(id="ms_corpus_source", name="为她而唱 · 素材文件操作",
                   description="preview=试听原文件 / hide=隐藏（不计时不训练，可恢复）/ show=取消隐藏 / delete=移到回收站",

@@ -1658,6 +1658,8 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const [preview, setPreview] = useState(null);
     const [busy, setBusy] = useState("");
     const [errMsg, setErrMsg] = useState("");
+    const [selected, setSelected] = useState([]);
+    const [clearArm, setClearArm] = useState(false);
     const [removed, setRemoved] = useState([]);
     const all = Array.isArray(props.files) ? props.files : [];
     const visible = all.filter((f) => !(f && f.hidden));
@@ -1672,6 +1674,41 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const isDone = (src) => Boolean(src) && (src.status === "done" || !src.status && (src.clips || []).length > 0);
     const isProcessing = (src) => Boolean(src) && src.status === "processing";
     const isQueued = (src) => Boolean(src) && src.status === "queued";
+    const selectable = rows.map((f) => String(f && f.id || "")).filter(Boolean);
+    const allSelected = selectable.length > 0 && selectable.every((id) => selected.indexOf(id) >= 0);
+    const toggleSel = (id) => setSelected((prev) => prev.indexOf(id) >= 0 ? prev.filter((x) => x !== id) : prev.concat([id]));
+    const toggleAll = () => setSelected(allSelected ? [] : selectable);
+    const removeMany = async (ids, clearAll2 = false) => {
+      if (busy) return;
+      setBusy("batch");
+      setErrMsg("");
+      try {
+        const args = clearAll2 ? { slot: props.slot, all: true } : { source_ids: ids };
+        const r = await callEntry(props.api, "ms_corpus_delete_sources", args, 6e5);
+        if (r && r.ok === false) {
+          setErrMsg(String(r && r.error || "没删成功"));
+          return;
+        }
+        const skip = r && Array.isArray(r.skipped_active) ? r.skipped_active : [];
+        if (skip.length) setErrMsg("有 " + skip.length + " 个正在处理，等它处理完再删");
+        setSelected([]);
+        setRemoved((prev) => prev.concat(ids.length ? ids : selectable));
+        props.onChanged();
+      } catch (e) {
+        setErrMsg(String(e && e.message || e));
+      } finally {
+        setBusy("");
+        setClearArm(false);
+      }
+    };
+    const clearAll = () => {
+      if (!clearArm) {
+        setClearArm(true);
+        setTimeout(() => setClearArm(false), 5e3);
+        return;
+      }
+      removeMany(selectable, true);
+    };
     const act = async (sourceId, action) => {
       if (!sourceId || busy) return;
       if (action === "delete") setRemoved((prev) => prev.concat([sourceId]));
@@ -1725,6 +1762,9 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
         hidden.length ? " · 已隐藏 " + hidden.length : ""
       ] }),
       /* @__PURE__ */ jsxs(Row, { style: { gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }, children: [
+        selectable.length ? /* @__PURE__ */ jsx(Btn, { disabled: Boolean(busy), onClick: toggleAll, children: allSelected ? "取消全选" : "全选" }) : null,
+        selected.length ? /* @__PURE__ */ jsx(Btn, { disabled: Boolean(busy), onClick: () => removeMany(selected), children: busy === "batch" ? "删除中…" : "删除选中 (" + selected.length + ")" }) : null,
+        selectable.length ? /* @__PURE__ */ jsx(Btn, { style: DANGER, disabled: Boolean(busy), onClick: clearAll, children: clearArm ? "再点一次确认清空" : "清空这类 (" + selectable.length + ")" }) : null,
         hidden.length ? /* @__PURE__ */ jsx(Btn, { onClick: () => setShowHidden(!showHidden), children: showHidden ? "收起已隐藏" : "显示已隐藏 " + hidden.length }) : null,
         all.length ? /* @__PURE__ */ jsx(Btn, { onClick: () => setOpen(!open), children: open ? "收起" : "展开" }) : null
       ] })
@@ -1765,6 +1805,15 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
                 border: "1px solid " + (done2 ? "rgba(31,157,99,0.35)" : LINE)
               }, children: [
                 /* @__PURE__ */ jsxs(Row, { style: { gap: 8, alignItems: "center", minWidth: 0 }, children: [
+                  id ? /* @__PURE__ */ jsx(
+                    "input",
+                    {
+                      type: "checkbox",
+                      checked: selected.indexOf(id) >= 0,
+                      onChange: () => toggleSel(id),
+                      style: { margin: 0, flex: "0 0 auto" }
+                    }
+                  ) : null,
                   /* @__PURE__ */ jsx("span", { style: { width: 22, height: 22, borderRadius: 7, background: done2 ? "rgba(31,157,99,0.14)" : "rgba(224,45,118,0.10)", color: tone, display: "grid", placeItems: "center", fontSize: 11, flex: "0 0 auto" }, children: done2 ? "✓" : isHidden ? "○" : props.slot === "song" ? "♪" : props.slot === "dry_sing" ? "◍" : "⌨" }),
                   /* @__PURE__ */ jsx("div", { title: nameOf(f, i), style: { minWidth: 0, flex: 1, fontSize: 12.5, color: INK, lineHeight: "18px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, children: nameOf(f, i) }),
                   done2 ? /* @__PURE__ */ jsx("span", { style: { fontSize: 11, color: "#1c8a58", background: "rgba(31,157,99,0.14)", borderRadius: 999, padding: "1px 9px", fontWeight: 600, flex: "0 0 auto" }, children: "完成" }) : proc ? /* @__PURE__ */ jsx("span", { style: { fontSize: 11, color: "#b06a00", background: "#fff4e2", borderRadius: 999, padding: "1px 9px", flex: "0 0 auto" }, children: "处理中" }) : queued ? /* @__PURE__ */ jsx("span", { style: { fontSize: 11, color: "#6b6b76", background: "rgba(40,37,50,0.06)", borderRadius: 999, padding: "1px 9px", flex: "0 0 auto" }, children: "排队中" }) : null

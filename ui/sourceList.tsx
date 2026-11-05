@@ -57,6 +57,8 @@ export function SourceFileList(props: {
   const [preview, setPreview] = useState<any>(null)
   const [busy, setBusy] = useState("")
   const [errMsg, setErrMsg] = useState("")
+  const [selected, setSelected] = useState<string[]>([])
+  const [clearArm, setClearArm] = useState(false)
   // 删除成功后先本地移除这一行：不用等刷新，也避免对着同一行连点
   const [removed, setRemoved] = useState<string[]>([])
 
@@ -75,6 +77,44 @@ export function SourceFileList(props: {
   const isDone = (src: any) => Boolean(src) && (src.status === "done" || (!src.status && (src.clips || []).length > 0))
   const isProcessing = (src: any) => Boolean(src) && src.status === "processing"
   const isQueued = (src: any) => Boolean(src) && src.status === "queued"
+
+  const selectable = rows.map((f: any) => String((f && f.id) || "")).filter(Boolean)
+  const allSelected = selectable.length > 0 && selectable.every((id: string) => selected.indexOf(id) >= 0)
+  const toggleSel = (id: string) => setSelected((prev) => prev.indexOf(id) >= 0 ? prev.filter((x) => x !== id) : prev.concat([id]))
+  const toggleAll = () => setSelected(allSelected ? [] : selectable)
+
+  const removeMany = async (ids: string[], clearAll = false) => {
+    if (busy) return
+    setBusy("batch")
+    setErrMsg("")
+    try {
+      const args: any = clearAll ? { slot: props.slot, all: true } : { source_ids: ids }
+      const r: any = await callEntry(props.api, "ms_corpus_delete_sources", args, 600000)
+      if (r && r.ok === false) {
+        setErrMsg(String((r && r.error) || "没删成功"))
+        return
+      }
+      const skip = (r && Array.isArray(r.skipped_active)) ? r.skipped_active : []
+      if (skip.length) setErrMsg("有 " + skip.length + " 个正在处理，等它处理完再删")
+      setSelected([])
+      setRemoved((prev) => prev.concat(ids.length ? ids : selectable))
+      props.onChanged()
+    } catch (e: any) {
+      setErrMsg(String((e && e.message) || e))
+    } finally {
+      setBusy("")
+      setClearArm(false)
+    }
+  }
+
+  const clearAll = () => {
+    if (!clearArm) {
+      setClearArm(true)
+      setTimeout(() => setClearArm(false), 5000)
+      return
+    }
+    removeMany(selectable, true)
+  }
 
   const act = async (sourceId: string, action: string) => {
     if (!sourceId || busy) return
@@ -126,6 +166,19 @@ export function SourceFileList(props: {
         {hidden.length ? " · 已隐藏 " + hidden.length : ""}
       </Muted>
       <Row style={{ gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
+        {selectable.length ? (
+          <Btn disabled={Boolean(busy)} onClick={toggleAll}>{allSelected ? "取消全选" : "全选"}</Btn>
+        ) : null}
+        {selected.length ? (
+          <Btn disabled={Boolean(busy)} onClick={() => removeMany(selected)}>
+            {busy === "batch" ? "删除中…" : "删除选中 (" + selected.length + ")"}
+          </Btn>
+        ) : null}
+        {selectable.length ? (
+          <Btn style={DANGER} disabled={Boolean(busy)} onClick={clearAll}>
+            {clearArm ? "再点一次确认清空" : "清空这类 (" + selectable.length + ")"}
+          </Btn>
+        ) : null}
         {hidden.length ? (
           <Btn onClick={() => setShowHidden(!showHidden)}>
             {showHidden ? "收起已隐藏" : "显示已隐藏 " + hidden.length}
@@ -181,6 +234,11 @@ export function SourceFileList(props: {
                 }}>
                   {/* 名字单独一行：卡片很窄，和三个按钮挤在一行会被截成「文…」 */}
                   <Row style={{ gap: 8, alignItems: "center", minWidth: 0 }}>
+                    {id ? (
+                      <input type="checkbox" checked={selected.indexOf(id) >= 0}
+                             onChange={() => toggleSel(id)}
+                             style={{ margin: 0, flex: "0 0 auto" }} />
+                    ) : null}
                     <span style={{ width: 22, height: 22, borderRadius: 7, background: done ? "rgba(31,157,99,0.14)" : "rgba(224,45,118,0.10)", color: tone, display: "grid", placeItems: "center", fontSize: 11, flex: "0 0 auto" }}>
                       {done ? "✓" : isHidden ? "○" : props.slot === "song" ? "♪" : props.slot === "dry_sing" ? "◍" : "⌨"}
                     </span>
