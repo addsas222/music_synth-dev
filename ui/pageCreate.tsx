@@ -4,7 +4,7 @@
 // 「生成并让她唱」会直接复用现有链路：分离 → DDSP 变声 → 混音。
 import { Alert, StatusBadge, useEffect, useRef, useState } from "@neko/plugin-ui"
 import { callEntry } from "./api"
-import { BRAND_DEEP, INK, INK_2, Btn, Col, Field, FoldCard, Grid, Input, Muted, Panel, PRIMARY_BTN, Pill, Row, Section, Select, Toggle } from "./ui"
+import { BRAND_DEEP, INK, INK_2, LINE, Btn, Col, Field, FoldCard, Grid, Input, Muted, Panel, PRIMARY_BTN, Pill, Row, Section, Select, Soft, Toggle } from "./ui"
 
 const TA_STYLE = {
   border: "1px solid transparent", borderRadius: 12, padding: "9px 14px", fontSize: 13,
@@ -28,32 +28,52 @@ export function PageCreate(props: { api: any; snap: any; onRefresh: () => void; 
   const [language, setLanguage] = useState("auto")
   const [instrumental, setInstrumental] = useState(false)
   const [lora, setLora] = useState("")
+  const [postEngine, setPostEngine] = useState("")
+  const [soulxStatus, setSoulxStatus] = useState<any>(null)
+  const [installConfirm, setInstallConfirm] = useState<any>(null)
+  const [openAdv, setOpenAdv] = useState(false)
+  const [advSteps, setAdvSteps] = useState("0")
+  const [advGuidance, setAdvGuidance] = useState("7")
+  const [advSeed, setAdvSeed] = useState("-1")
+  const [model, setModel] = useState("")
+  const modelTouched = useRef(false)
+  const loraTouched = useRef(false)
   const [busy, setBusy] = useState("")
   const [jobId, setJobId] = useState("")
   const [job, setJob] = useState<any>(null)
   const [notice, setNotice] = useState<any>(null)
   const poll = useRef<any>(null)
-  const [trainOpen, setTrainOpen] = useState(false)
-  const [trainName, setTrainName] = useState("")
-  const [trainEpochs, setTrainEpochs] = useState("")
-  const [trainRank, setTrainRank] = useState("")
-  const trainTouched = useRef(false)
-  const [trainBusy, setTrainBusy] = useState("")
 
   const check = async () => {
     try {
       const r: any = await callEntry(api, "ms_ace_status", {}, 30000)
       setStatus(r)
-      const td = r && r.train_defaults
-      if (td && !trainTouched.current) {
-        setTrainEpochs(String(td.epochs || ""))
-        setTrainRank(String(td.rank || ""))
+      if (r && r.model && !modelTouched.current) setModel(String(r.model))
+      const cfgLora = String((r && r.ace_lora) || "")
+      if (cfgLora && !loraTouched.current) {
+        setLora(cfgLora)
+        // 当前模型没有这个音色的版本时，自动切到它有版本的底模
+        const hit = (r.loras || []).find((x: any) => x.name === cfgLora)
+        const bases = (hit && Array.isArray(hit.variants))
+          ? hit.variants.map((v: any) => String(v.base || "")).filter(Boolean) : []
+        if (!modelTouched.current && bases.length && !bases.includes(String(r.model || ""))) {
+          const pick = bases.find((b: string) =>
+            Array.isArray(r.models) && r.models.includes(b))
+          if (pick) { modelTouched.current = true; setModel(pick) }
+        }
       }
     } catch (e: any) {
       setStatus({ ok: false, problems: [String((e && e.message) || e)] })
     }
   }
   useEffect(() => { check(); return () => { if (poll.current) clearInterval(poll.current) } }, [])
+  useEffect(() => {
+    let alive = true
+    callEntry(api, "ms_soulx_status", {}, 30000)
+      .then((r: any) => { if (alive) setSoulxStatus(r) })
+      .catch(() => {})
+    return () => { alive = false }
+  }, [])
 
   useEffect(() => {
     if (!jobId) return
@@ -61,15 +81,25 @@ export function PageCreate(props: { api: any; snap: any; onRefresh: () => void; 
       try {
         const r: any = await callEntry(api, "ms_ace_job", { job_id: jobId }, 30000)
         const j = (r && r.job) || null
+        // 插件重载/重启会把内存里的任务带走；ms_ace_job 会返回 found=false。
+        // 以前这里只认 done/failed，于是面板会永远停在「正在生成」且没有进度条。
+        if (!j || (r && r.found === false)) {
+          if (poll.current) { clearInterval(poll.current); poll.current = null }
+          setJob(null)
+          setBusy("")
+          setJobId("")
+          setNotice({
+            tone: "error",
+            text: "生成任务丢了（插件重载/重启）。已经做好的歌可在「让她唱歌」里找到；请重新点一次生成。",
+          })
+          check()
+          props.onRefresh()
+          return
+        }
         setJob(j)
-        if (j && (j.state === "done" || j.state === "failed")) {
+        if (j.state === "done" || j.state === "failed") {
           if (poll.current) { clearInterval(poll.current); poll.current = null }
           setBusy("")
-          setTrainBusy("")
-          if (j.state === "done" && j.lora_path) {
-            const parts = String(j.lora_path).split(/[\\/]/)
-            setLora(parts[parts.length - 1] || "")
-          }
           check()
           props.onRefresh()
         }
@@ -100,8 +130,11 @@ export function PageCreate(props: { api: any; snap: any; onRefresh: () => void; 
         language,
         instrumental,
         auto_sing: sing && !lora.trim(),
-        inference_steps: 12,
-        guidance_scale: 7.0,
+        post_engine: sing ? postEngine : "",
+        inference_steps: Number(advSteps) || 0,
+        guidance_scale: Number(advGuidance) || 7,
+        seed: String(advSeed).trim() === "" ? -1 : Number(advSeed),
+        model,
         lora,
       }, 60000)
       if (r && r.ok && r.job_id) {
@@ -138,48 +171,97 @@ export function PageCreate(props: { api: any; snap: any; onRefresh: () => void; 
     }
   }
 
-  const ready = status && status.ok
-  const loras = (status && Array.isArray(status.loras)) ? status.loras : []
-
-  const startTrain = async () => {
-    if (trainBusy) return
-    if (!ready) { setNotice({ tone: "error", text: "ACE 环境还没就绪" }); return }
-    setTrainBusy("start")
+  const downloadModel = async (force = false) => {
+    if (busy) return
+    const target = String(model || "").trim()
+    if (!target) { setNotice({ tone: "error", text: "先选一个模型" }); return }
+    setBusy("download")
     setNotice(null)
     setJob(null)
     setJobId("")
     try {
-      const r: any = await callEntry(api, "ms_ace_train", {
-        name: trainName.trim(),
-        epochs: Number(trainEpochs) || 0,
-        rank: Number(trainRank) || 0,
-      }, 60000)
+      const r: any = await callEntry(api, "ms_ace_download",
+        { model: target, force: !!force }, 60000)
       if (r && r.ok && r.job_id) {
         setJobId(String(r.job_id))
-        setNotice({ tone: "info", text: "开始训练：" + (r.name || "") + "，素材 " + (r.samples || 0) + " 段" })
+        setNotice({ tone: "info", text: "开始下载：" + target + "（可断点续传）" })
+      } else if (r && r.ok && r.already) {
+        setBusy("")
+        setNotice({ tone: "info", text: "这个模型已经下载好了" })
+        check()
+      } else if (r && r.need_confirm) {
+        setBusy("")
+        setInstallConfirm(r)
       } else {
-        setTrainBusy("")
-        setNotice({ tone: "error", text: "没能开始训练：" + ((r && r.error) || "未知错误") })
+        setBusy("")
+        setNotice({ tone: "error", text: "没能开始下载：" + ((r && r.error) || "未知错误") })
       }
     } catch (e: any) {
-      setTrainBusy("")
+      setBusy("")
       setNotice({ tone: "error", text: String((e && e.message) || e) })
     }
   }
 
-  const stateText = !job ? "" : job.state === "queued" ? "排队中" : job.state === "running" ? "生成中" : job.state === "done" ? "已完成" : job.state === "failed" ? "失败" : job.state
-  const isTrainJob = Boolean(job && job.job === "ace-train")
+  const loras = (status && Array.isArray(status.loras)) ? status.loras : []
+  const catalog = (status && Array.isArray(status.model_catalog)) ? status.model_catalog : []
+  const modelMeta = (name: string) => catalog.find((m: any) => m.name === name) || null
+  const modelChoices = catalog.length
+    ? catalog.map((m: any) => m.name)
+    : (status && Array.isArray(status.model_choices) && status.model_choices.length)
+      ? status.model_choices
+      : (status && status.model ? [status.model] : ["acestep-v15-turbo"])
+  const MODEL_HINT: any = {
+    "acestep-v15-turbo": "2B · 8 步 · 快",
+    "acestep-v15-xl-turbo": "4B · 8 步 · 音质更高",
+    "acestep-v15-xl-sft": "4B · 50 步 · 最高质量，慢",
+    "acestep-v15-xl-base": "4B · 50 步 · 全能编辑",
+    "acestep-v15-sft": "2B · 50 步",
+    "acestep-v15-base": "2B · 50 步 · 全能编辑",
+  }
+  const modelReady = !status || !model || (Array.isArray(status.models) && status.models.includes(model))
+  const otherProblems = (status && Array.isArray(status.problems) ? status.problems : [])
+    .filter((p: any) => !String(p).startsWith("ACE 模型 "))
+  const ready = Boolean(status && modelReady && otherProblems.length === 0)
+  const loraVariantsOf = (name: string) => {
+    const hit = loras.find((l: any) => l.name === name)
+    const variants = hit && Array.isArray(hit.variants) ? hit.variants : []
+    if (variants.length) return variants
+    return hit && hit.base ? [{ name: hit.name, base: hit.base, path: hit.path }] : []
+  }
+  const loraBasesOf = (name: string) => loraVariantsOf(name)
+    .map((v: any) => String(v.base || "")).filter(Boolean)
+  const pickLora = (name: string) => {
+    loraTouched.current = true
+    setLora(name)
+    if (!name) return
+    const variants = loraVariantsOf(name)
+    if (!variants.length) return
+    if (variants.some((v: any) => v.base === model)) return
+    const target = variants.find((v: any) =>
+      Array.isArray(status?.models) && status.models.includes(v.base))
+    if (target && target.base) {
+      modelTouched.current = true
+      setModel(String(target.base))
+      setNotice({ tone: "info", text: `「${name}」没有 ${model} 版本，已自动切到 ${target.base}` })
+    } else {
+      setNotice({ tone: "error", text: `「${name}」需要的底模还没下载：${variants.map((v: any) => v.base).join("、")}` })
+    }
+  }
+
+  const isDownloadJob = Boolean(job && job.job === "ace-download")
+  const stateText = !job ? "" : job.state === "queued" ? "排队中" : job.state === "running" ? (isDownloadJob ? "下载中" : "生成中") : job.state === "done" ? "已完成" : job.state === "failed" ? "失败" : job.state
 
   return (
     <Col style={{ gap: 24 }}>
       {notice ? <Alert tone={notice.tone === "error" ? "warning" : "info"}>{notice.text}</Alert> : null}
-      {status && !status.ok ? (
+      {status && !ready ? (
         <Alert tone="warning">
           <Col style={{ gap: 8 }}>
-            <div>原创生成还没就绪：{(status.problems || []).join("、")}</div>
+            <div>原创生成还没就绪：{(otherProblems.length ? otherProblems : ["ACE 模型 " + (model || status.model)]).join("、")}</div>
             <Row style={{ gap: 8, flexWrap: "wrap" }}>
               <Btn disabled={!!busy} onClick={install}>{busy === "install" ? "安装中…" : "安装 ACE 依赖"}</Btn>
-              <Muted>依赖约 100MB；模型会在第一次生成时自动下载到 {status.paths ? status.paths.checkpoints : "计算根目录"}。</Muted>
+              <Btn disabled={!!busy || modelReady} onClick={downloadModel}>{busy === "download" ? "下载中…" : "下载当前模型"}</Btn>
+              <Muted>依赖约 100MB；模型在「{model || "acestep-v15-turbo"}」没下载时会提示单独下载（XL 约 18.6GB）。</Muted>
             </Row>
           </Col>
         </Alert>
@@ -225,14 +307,95 @@ export function PageCreate(props: { api: any; snap: any; onRefresh: () => void; 
               </Row>
             </Field>
           </Grid>
-          <Field label="ACE 音色（LoRA；训练后可直接选）">
-            <Select value={lora} onChange={(e: any) => setLora(e.target.value)}>
+          <Field label="生成模型（质量 / 速度）">
+            <Select value={model} onChange={(e: any) => {
+              const v = e.target.value
+              modelTouched.current = true
+              setModel(v)
+              const variants = loraVariantsOf(lora)
+              if (lora && variants.length && !variants.some((x: any) => x.base === v)) {
+                setLora("")
+                setNotice({
+                  tone: "info",
+                  text: `已取消音色「${lora}」（它没有 ${v} 版本，可用于 ${variants.map((x: any) => x.base).join("、")}）`,
+                })
+              }
+              // 已下载的模型顺手记为默认，AI 之后不带 model 调用也会用它
+              if (Array.isArray(status?.models) && status.models.includes(v)) {
+                callEntry(api, "ms_set_config", { ace_model: v }, 30000).catch(() => {})
+              }
+            }}>
+              {modelChoices.map((m: any) => {
+                const meta = modelMeta(m)
+                return (
+                  <option key={m} value={m}>
+                    {m}{meta
+                      ? " · " + meta.family + " · " + meta.steps + "步 · 音质" + meta.quality
+                        + " · 需≥" + meta.vram_min_gb + "GB" + (meta.downloaded ? " · 已下载" : " · 未下载")
+                      : MODEL_HINT[m] ? " · " + MODEL_HINT[m] : ""}
+                  </option>
+                )
+              })}
+            </Select>
+          </Field>
+          {(() => {
+            const meta = modelMeta(model)
+            if (!meta) return null
+            return (
+              <Muted style={{ lineHeight: 1.8 }}>
+                能提升：{(meta.gains || []).join("；")}。适合：{meta.best_for}。
+                {" "}{meta.downloaded
+                  ? "已下载。"
+                  : "还没下载，约 " + meta.download_gb + "GB，需要至少 " + meta.vram_min_gb + "GB 显存。"}
+              </Muted>
+            )
+          })()}
+          {status && status.model_recommended ? (
+            <Muted>这台电脑推荐：{status.model_recommended}（按显存自动判断）</Muted>
+          ) : null}
+          {!modelReady ? (
+            <Row style={{ flexWrap: "wrap", gap: 10, alignItems: "center" }}>
+              <Muted>这个模型还没下载（XL 仓库约 18.6GB，需要 ≥12GB 显存；可断点续传）。</Muted>
+              <Btn disabled={!!busy} onClick={downloadModel}>{busy === "download" ? "启动下载…" : "下载这个模型"}</Btn>
+            </Row>
+          ) : null}
+          <Field label="ACE 音色（LoRA；按模型自动选版本）">
+            <Select value={lora} onChange={(e: any) => pickLora(e.target.value)}>
               <option value="">默认音色（不加载 LoRA）</option>
-              {loras.map((l: any) => <option key={l.name} value={l.name}>{l.name}</option>)}
+              {loras.map((l: any) => (
+                <option key={l.name} value={l.name}>
+                  {l.name}{loraBasesOf(l.name).length ? " · " + loraBasesOf(l.name).join(" / ") : ""}
+                </option>
+              ))}
             </Select>
           </Field>
           {lora ? (
-            <Muted>已选 ACE 音色：生成结果直接就是该音色，不会再走 DDSP 二次变声。</Muted>
+            <Muted>
+              已选 ACE 音色「{lora}」
+              {loraBasesOf(lora).length ? "（可用于 " + loraBasesOf(lora).join("、") + "）" : ""}
+              ：生成时会自动挑当前模型对应的版本；默认直接用 ACE 唱这个音色。
+            </Muted>
+          ) : null}
+          <Field label="唱完后再处理干声">
+            <Select value={postEngine} onChange={(e: any) => setPostEngine(e.target.value)}>
+              <option value="">不用（ACE 直接出成品）</option>
+              <option value="ddsp">用翻唱声音（DDSP）</option>
+              <option value="soulx">SoulX-Singer SVC（实验）</option>
+            </Select>
+          </Field>
+          {postEngine ? (
+            <Muted style={{ lineHeight: 1.75 }}>
+              {postEngine === "soulx"
+                ? "ACE 先生成整首，再取干声走 SoulX-Singer SVC，最后和伴奏混回去。"
+                : "ACE 先生成整首，再取干声用当前翻唱声音变声，最后和伴奏混回去。"}
+              点「只生成」时不会后处理。
+            </Muted>
+          ) : null}
+          {postEngine === "soulx" && soulxStatus && !soulxStatus.ready ? (
+            <Row style={{ flexWrap: "wrap", gap: 8, alignItems: "center" }}>
+              <Muted>SoulX 还没就绪：{(soulxStatus.problems || []).join("、")}</Muted>
+              <Btn onClick={() => callEntry(api, "ms_soulx_status", {}, 30000).then(setSoulxStatus).catch(() => {})}>重新检查</Btn>
+            </Row>
           ) : null}
           <Row style={{ flexWrap: "wrap", alignItems: "center", gap: 14 }}>
             <Muted>首次加载 ACE 模型会慢一些；同一时间只跑一个生成/唱的任务。</Muted>
@@ -247,60 +410,15 @@ export function PageCreate(props: { api: any; snap: any; onRefresh: () => void; 
         </Col>
       </Panel>
 
-      <FoldCard open={trainOpen} onToggle={() => setTrainOpen(!trainOpen)}
-                title="训练 ACE 音色（LoRA）"
-                sub={<Muted>让 ACE 直接唱出目标音色，而不是每次生成后再变声</Muted>}>
-        <Col style={{ gap: 14 }}>
-          <Muted>
-            素材固定取「准备素材」里已经处理好的切片
-            （当前 {status && typeof status.train_clips === "number" ? status.train_clips : "?"} 段）。
-            风格由系统根据音色自动判断，歌词使用通用元音，不需要你填英文。
-            训练会长时间占用显卡，期间翻唱/生成会排队。
-          </Muted>
-          <Grid cols={3} min={200} gap={14}>
-            <Field label="音色名（留空自动命名）">
-              <Input value={trainName} placeholder="例如 梦梦pro" onChange={(e: any) => setTrainName(e.target.value)} />
-            </Field>
-            <Field label="训练轮数（1～100）">
-              <Input type="number" min={1} max={100} step={1} value={trainEpochs}
-                     onChange={(e: any) => { trainTouched.current = true; setTrainEpochs(e.target.value) }} />
-            </Field>
-            <Field label="LoRA rank（4～128）">
-              <Input type="number" min={4} max={128} step={4} value={trainRank}
-                     onChange={(e: any) => { trainTouched.current = true; setTrainRank(e.target.value) }} />
-            </Field>
-          </Grid>
-          {status && status.train_defaults ? (
-            <Row style={{ flexWrap: "wrap", gap: 8, alignItems: "center" }}>
-              <Muted>
-                系统推荐：{status.train_defaults.epochs} 轮 · rank {status.train_defaults.rank}
-                （{status.train_defaults.reason}）
-              </Muted>
-              <Btn onClick={() => {
-                trainTouched.current = false
-                setTrainEpochs(String(status.train_defaults.epochs || ""))
-                setTrainRank(String(status.train_defaults.rank || ""))
-              }}>恢复推荐</Btn>
-            </Row>
-          ) : null}
-          <Row style={{ flexWrap: "wrap", alignItems: "center", gap: 12 }}>
-            <Btn style={PRIMARY_BTN} disabled={!ready || !!trainBusy || !!busy} onClick={startTrain}>
-              {trainBusy ? "正在训练…" : "开始训练"}
-            </Btn>
-            <Muted>首次训练约 10～40 分钟，取决于素材量和轮数；显卡显存占用约 6～10GB。</Muted>
-          </Row>
-        </Col>
-      </FoldCard>
-
       {job ? (
-        <Section title={isTrainJob ? "训练进度" : "生成进度"} extra={<Muted>{stateText}</Muted>}>
+        <Section title={isDownloadJob ? "模型下载" : "生成进度"} extra={<Muted>{stateText}</Muted>}>
           <Panel>
             <Col style={{ gap: 10 }}>
               <Row style={{ justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
                 <div style={{ fontSize: 14, fontWeight: 700, color: INK }}>
-                  {job.state === "done" ? (isTrainJob ? "训练完成" : "生成完成")
-                    : job.state === "failed" ? (isTrainJob ? "训练失败" : "生成失败")
-                    : (isTrainJob ? "ACE 音色训练中" : "ACE-Step 正在生成")}
+                  {job.state === "done" ? (isDownloadJob ? "模型下载完成" : "生成完成")
+                    : job.state === "failed" ? (isDownloadJob ? "模型下载失败" : "生成失败")
+                    : (isDownloadJob ? "正在下载模型" : "ACE-Step 正在生成")}
                 </div>
                 <StatusBadge tone={job.state === "done" ? "success" : job.state === "failed" ? "error" : "warning"}>
                   {stateText}
@@ -310,17 +428,44 @@ export function PageCreate(props: { api: any; snap: any; onRefresh: () => void; 
                 <div style={{ width: (Number(job.progress) || (job.state === "done" ? 100 : 15)) + "%", height: "100%", background: BRAND_DEEP }} />
               </div>
               <Muted>{job.detail || job.message || "正在准备…"}</Muted>
+              {job.state === "running" && Number(job.progress || 0) <= 5 ? (
+                <Muted>ACE 首次加载模型较慢；若长时间停在 5% 且没有变化，可能是插件被重载了，请重新点一次生成。</Muted>
+              ) : null}
               {job.state === "done" ? (
                 <Row style={{ flexWrap: "wrap", gap: 8 }}>
-                  {isTrainJob ? <Btn style={PRIMARY_BTN} onClick={check}>刷新音色列表</Btn> : null}
-                  <Btn style={isTrainJob ? undefined : PRIMARY_BTN} onClick={() => props.onGo("sing")}>去「让她唱歌」看看</Btn>
-                  <Btn onClick={() => props.onGo("models")}>我的声音</Btn>
+                  {isDownloadJob ? <Btn style={PRIMARY_BTN} onClick={check}>刷新环境</Btn> : null}
+                  {isDownloadJob ? <Btn style={PRIMARY_BTN} onClick={check}>刷新环境</Btn> : null}
+                  {!isDownloadJob ? <Btn style={PRIMARY_BTN} onClick={() => props.onGo("sing")}>去「让她唱歌」看看</Btn> : null}
                 </Row>
               ) : null}
             </Col>
           </Panel>
         </Section>
       ) : null}
+
+      <FoldCard open={openAdv} onToggle={() => setOpenAdv(!openAdv)}
+                title="高级选项"
+                sub={<Muted>采样步数、引导强度、随机种子</Muted>}>
+        <Col style={{ gap: 14 }}>
+          <Grid cols={3} min={200} gap={14}>
+            <Field label="采样步数（0 = 自动）">
+              <Input type="number" min={0} max={60} step={1} value={advSteps}
+                     onChange={(e: any) => setAdvSteps(e.target.value)} />
+            </Field>
+            <Field label="引导强度（turbo 忽略）">
+              <Input type="number" min={1} max={15} step={0.5} value={advGuidance}
+                     onChange={(e: any) => setAdvGuidance(e.target.value)} />
+            </Field>
+            <Field label="随机种子（-1 = 随机）">
+              <Input type="number" min={-1} step={1} value={advSeed}
+                     onChange={(e: any) => setAdvSeed(e.target.value)} />
+            </Field>
+          </Grid>
+          <Muted>
+            默认即可：turbo 模型固定 8 步且不使用 CFG；sft/base 默认 50 步。固定种子后，同样的描述和歌词会得到更接近的结果。
+          </Muted>
+        </Col>
+      </FoldCard>
 
       <Section title="说明" extra={<Muted>本地运行，不联网、不需要账号</Muted>}>
         <Panel>
@@ -332,6 +477,27 @@ export function PageCreate(props: { api: any; snap: any; onRefresh: () => void; 
           </Col>
         </Panel>
       </Section>
+
+      {installConfirm ? (
+        <Soft style={{ position: "fixed", inset: 0, zIndex: 1160, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(40,37,50,0.38)" }}>
+          <div style={{ background: "#fff", borderRadius: 20, padding: 22, maxWidth: 460, boxShadow: "0 18px 44px rgba(40,37,50,0.22)" }}>
+            <div style={{ fontSize: 15, fontWeight: 700, color: INK }}>这台电脑可能带不动这个模型</div>
+            <div style={{ fontSize: 12.5, color: INK_2, lineHeight: 1.85, margin: "10px 0 16px" }}>
+              {installConfirm.warning}
+              {" "}仍然可以安装，只是生成时可能很慢或失败。
+            </div>
+            <Row style={{ justifyContent: "flex-end" }}>
+              <Btn onClick={() => setInstallConfirm(null)}>先不装</Btn>
+              <Btn style={PRIMARY_BTN} onClick={() => {
+                const target = installConfirm.model
+                setInstallConfirm(null)
+                setModel(String(target || ""))
+                downloadModel(true)
+              }}>仍然安装</Btn>
+            </Row>
+          </div>
+        </Soft>
+      ) : null}
     </Col>
   )
 }

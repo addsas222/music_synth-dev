@@ -1,23 +1,31 @@
-import numpy as np
-import soundfile as sf
-import torch
 import torchaudio
+
+
+def _load_with_soundfile(audio_path: str):
+    """Fallback when torchaudio's torchcodec backend is unavailable.
+
+    Windows + torch 2.9 often has torchaudio but no loadable FFmpeg DLLs for
+    torchcodec.  soundfile handles WAV/FLAC/OGG natively and the corpus clips
+    are WAV, so this keeps training working without a system FFmpeg backend.
+    """
+    import numpy as np
+    import soundfile as sf
+    import torch
+
+    data, sr = sf.read(audio_path, always_2d=True, dtype="float32")
+    return torch.from_numpy(np.ascontiguousarray(data.T)), sr
 
 
 def load_audio_stereo(audio_path: str, target_sample_rate: int, max_duration: float):
     """Load audio, resample, convert to stereo, and truncate."""
-    # torchaudio 2.9 delegates load() to torchcodec, which is not bundled here.
-    # soundfile handles wav/flac natively and avoids that extra dependency.
     try:
-        data, sr = sf.read(audio_path, dtype="float32", always_2d=True)
-        audio = torch.from_numpy(np.ascontiguousarray(data.T))
-    except Exception:
         audio, sr = torchaudio.load(audio_path)
-        if audio.dtype != torch.float32:
-            audio = audio.float()
+    except Exception:  # noqa: BLE001 - torchcodec/FFmpeg unavailable
+        audio, sr = _load_with_soundfile(audio_path)
 
     if sr != target_sample_rate:
-        audio = torchaudio.functional.resample(audio, sr, target_sample_rate)
+        resampler = torchaudio.transforms.Resample(sr, target_sample_rate)
+        audio = resampler(audio)
 
     if audio.shape[0] == 1:
         audio = audio.repeat(2, 1)

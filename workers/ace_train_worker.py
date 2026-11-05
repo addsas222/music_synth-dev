@@ -20,9 +20,21 @@ from pathlib import Path
 
 AUDIO_EXTS = {".wav", ".flac", ".mp3", ".m4a", ".ogg", ".aac", ".wma"}
 
+# 插件里的模型目录名 -> ACE-Step training_v2 的 variant 别名
+MODEL_ALIASES = {
+    "acestep-v15-turbo": "turbo",
+    "acestep-v15-base": "base",
+    "acestep-v15-sft": "sft",
+    "acestep-v15-xl-turbo": "xl_turbo",
+    "acestep-v15-xl-base": "xl_base",
+    "acestep-v15-xl-sft": "xl_sft",
+}
+
 
 def _safe_name(text: str) -> str:
-    name = re.sub(r'[\\/:*?"<>|\s]+', "_", str(text or "")).strip(" .")[:40]
+    # 60 chars: the plugin appends a variant suffix (e.g. _xl_turbo) when
+    # training several base models; truncating at 40 could collide.
+    name = re.sub(r'[\\/:*?"<>|\s]+', "_", str(text or "")).strip(" .")[:60]
     return name or "ace_voice"
 
 
@@ -98,6 +110,10 @@ def main() -> int:
         from acestep.training.path_safety import set_safe_root
         set_safe_root(str(project_root))
 
+        model_name = str(job.get("model_name") or "acestep-v15-turbo").strip()
+        model_alias = str(job.get("model_alias") or MODEL_ALIASES.get(model_name) or "turbo")
+        print(f"[ace-train] base model: {model_name} (variant={model_alias})", flush=True)
+
         # 固定通道：插件直接传「准备素材」里已处理的切片；兼容旧的 audio_dir 参数
         paths = [Path(str(x)) for x in (job.get("audio_paths") or [])
                  if str(x) and Path(str(x)).is_file()]
@@ -148,7 +164,7 @@ def main() -> int:
             audio_dir=str(audio_dir),
             output_dir=str(tensors),
             checkpoint_dir=str(project_root / "checkpoints"),
-            variant="turbo",
+            variant=model_alias,
             max_duration=float(job.get("max_duration") or 60.0),
             dataset_json=str(dataset_json),
             device=str(job.get("device") or "cuda"),
@@ -166,7 +182,8 @@ def main() -> int:
         args = build_root_parser().parse_args([
             "--plain", "--yes", "fixed",
             "--checkpoint-dir", str(project_root / "checkpoints"),
-            "--model-variant", "acestep-v15-turbo",
+            "--model-variant", model_alias,
+            "--base-model", model_alias,
             "--device", str(job.get("device") or "cuda"),
             "--precision", str(job.get("precision") or "bf16"),
             "--dataset-dir", str(tensors),
@@ -193,6 +210,8 @@ def main() -> int:
         result.update({
             "ok": True,
             "name": name,
+            "model": model_name,
+            "model_alias": model_alias,
             "lora_path": str(saved),
             "samples": len(samples),
             "epochs": epochs,

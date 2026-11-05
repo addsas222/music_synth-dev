@@ -140,12 +140,43 @@ class MusicSynthPlugin(NekoPluginBase):
         self._pipeline = Pipeline(self._data_dir, self._plugin_dir)
         # 插件重启会把处理线程带走：上次遗留的 running/queued 标记为中断，
         # 否则列表里会永远停在一个不动的「正在处理 5%」。
+        resume_ids: list[str] = []
         try:
             for _t in self._pipeline.store.all():
-                if str(_t.get('status') or '') in ('running', 'queued'):
+                _status = str(_t.get('status') or '')
+                _running = _status in ('running', 'queued')
+                # 上一次重载已经标成「中断」、但还没续跑的，也要在这里接上，
+                # 否则装好新代码再重载一次，那条原创歌就永远停在 failed。
+                _already = (_status == 'failed'
+                            and str(_t.get('step') or '') == 'interrupted')
+                if not _running and not _already:
+                    continue
+                _tid = str(_t.get('id') or '')
+                if not _tid:
+                    continue
+                _art = _t.get('artifacts') or {}
+                _mid = any(
+                    Path(str(_v)).is_file()
+                    for _k, _v in _art.items()
+                    if _k != 'final' and _v
+                )
+                _attempts = int(_t.get('resume_attempts') or 0)
+                _msg = ('处理被中断（插件重载），点「继续唱」继续' if _mid
+                        else '处理被中断（插件重载），点「让她唱」重新开始')
+                if _running:
+                    _attempts += 1
                     self._pipeline.store.update(
-                        str(_t.get('id') or ''), status='failed', progress=0, step='interrupted',
-                        error='处理被中断（插件重载），点「重新唱一遍」继续')
+                        _tid, status='failed', progress=0, step='interrupted',
+                        error=_msg, interrupted=True, resume_attempts=_attempts)
+                else:
+                    self._pipeline.store.update(_tid, error=_msg, interrupted=True)
+                # 「生成并让她唱」是一次性全自动任务：原始歌就在 work/ace，
+                # 重载后不该再让用户点一次「让她唱」。只自动续跑这种任务，
+                # 最多两次，避免插件反复重载时无限重跑。
+                _src = str(_t.get('source') or '')
+                _auto = bool(_t.get('auto_sing')) or Path(_src).parent.name == 'ace'
+                if _auto and _attempts < 2:
+                    resume_ids.append(_tid)
         except Exception:  # noqa: BLE001
             pass
         self._jobs: dict[str, dict] = {}
@@ -224,6 +255,12 @@ class MusicSynthPlugin(NekoPluginBase):
         except Exception as exc:  # noqa: BLE001
             self.logger.warning("恢复训练任务失败：%s", exc)
             resumed = []
+        try:
+            chains = self._resume_train_chains()
+            if chains:
+                self.logger.info("已恢复 %d 个「翻唱→原创」训练串联", chains)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("恢复训练串联失败：%s", exc)
         # 上次正在「听歌录制」的话，重启后接着听（用户主动开过才恢复）
         try:
             if (self._data_dir / "listener" / "autostart.flag").is_file():
@@ -235,7 +272,11 @@ class MusicSynthPlugin(NekoPluginBase):
             self._thread("cache-cleanup", self._auto_cache_cleanup)
         except Exception as exc:  # noqa: BLE001
             self.logger.warning("启动缓存清理失败：%s", exc)
-        return Ok({"status": "ready", "resumed_training": resumed})
+        # 原创「生成并让她唱」被打断的话，重启后自己接着唱完，不用再点一次
+        if resume_ids:
+            self._thread("ms-auto-resume", self._auto_resume_tracks, list(resume_ids))
+        return Ok({"status": "ready", "resumed_training": resumed,
+                   "resuming_tracks": len(resume_ids)})
 
     async def shutdown(self, **_):
         self._shutdown = True
@@ -300,10 +341,20 @@ class MusicSynthPlugin(NekoPluginBase):
         # 标一下「成品到底还在不在」：记录里常见文件早被删了，面板据此禁用试听，而不是点了才报错
         for _t in tracks:
             _fin = str(((_t.get("artifacts") or {}).get("final")) or "")
+            _src = str(_t.get("source") or "")
             try:
-                _t["playable"] = bool(_fin) and Path(_fin).is_file()
+                _t["playable"] = (bool(_fin) and Path(_fin).is_file()) or (
+                    str(_t.get("origin") or "") == "ace"
+                    and bool(_src) and Path(_src).is_file())
             except OSError:
                 _t["playable"] = False
+            # 有没有可以接着用的中间结果：面板据此把按钮显示成「继续唱」
+            # 而不是从头再来（成品还在时仍然显示「重新唱一遍」）。
+            _art = _t.get("artifacts") or {}
+            _t["resumable"] = any(
+                bool(_v) and Path(str(_v)).is_file()
+                for _k, _v in _art.items()
+                if _k in ("vocals", "instrumental", "vocal_clean", "vocal_wav"))
         setup_state = self._setup_state()
         return {
             "ok": True,
@@ -643,6 +694,8 @@ class MusicSynthPlugin(NekoPluginBase):
                       "base_python": {"type": "string"},
                       "ddsp_root": {"type": "string"},
                       "ddsp_ckpt": {"type": "string"},
+                      "ace_model": {"type": "string",
+                                    "description": "ACE 原创生成用的 DiT 模型名"},
                       "key_shift": {"type": "integer", "minimum": -24, "maximum": 24},
                       "vocal_register_shift": {"type": "integer", "minimum": -12, "maximum": 12,
                                                "description": "音区偏移：保持音高、只挪发声区；±3 内高保真"},
@@ -700,12 +753,21 @@ class MusicSynthPlugin(NekoPluginBase):
                             bgm_gain_db: float = None, consonant: float = None,
                             cache_auto: bool = None, cache_days: int = None,
                             device: str = "", precision: str = "",
-                            max_parallel: int = -1, download_source: str = "", **_):
+                            max_parallel: int = -1, download_source: str = "",
+                            ace_model: str = "", **_):
         updates = {}
         if tier:
             updates["tier_override"] = "" if tier == "auto" else tier
         if sep_backend:
             updates["sep_backend"] = sep_backend
+        if ace_model:
+            name = Path(str(ace_model).strip()).name
+            p = self._ace_paths()
+            if not self._ace_model_ready(p["checkpoints"] / name):
+                return Ok({"ok": False,
+                           "error": f"ACE 模型不存在或未下载完整：{name}",
+                           "saved": {}})
+            updates["ace_model"] = name
         # None = 未传（保持原值）；"" = 显式清空，回到从 compute_root 派生的默认目录。
         if compute_root is not None:
             new_root = str(Path(compute_root).expanduser()) if compute_root else ""
@@ -952,8 +1014,19 @@ class MusicSynthPlugin(NekoPluginBase):
     def _train_repo(self) -> Path:
         return Path(str(self._pipeline.paths.get("ddsp_root") or ""))
 
-    def _train_base_ckpt(self) -> Path:
-        """内置训练底模（DDSP-SVC 6.3 PT）：所有训练都从这里起步，用户不可选。"""
+    def _train_base_ckpt(self, quality: str = "") -> Path:
+        """训练底模：按质量档位取对应权重，缺省回退到内置 6.3 底模。
+
+        档位对应的路径可以在设置里用 ddsp_base_low / ddsp_base_mid /
+        ddsp_base_high 指定；没配就用内置的 pretrain/reflow_base/model_0.pt。
+        """
+        raw = self._pipeline.paths.get("raw") or {}
+        tier = str(quality or "mid").strip().lower()
+        key = {"low": "ddsp_base_low", "mid": "ddsp_base_mid",
+               "high": "ddsp_base_high"}.get(tier, "")
+        chosen = str(raw.get(key) or "") if key else ""
+        if chosen and Path(chosen).is_file():
+            return Path(chosen)
         return Path(str(self._pipeline.paths.get("ddsp_pretrain_reflow") or ""))
 
     def _train_runs_root(self) -> Path:
@@ -1045,9 +1118,11 @@ class MusicSynthPlugin(NekoPluginBase):
             "python": str(python),
             "run_dir": str(run_dir),
             "name": str((state or {}).get("name") or run_dir.name),
-            # 训练起点固定为内置底模 6.3；state 里的旧 auto/scratch 不再生效。
-            "init_from": str(self._train_base_ckpt()),
-            "base_ckpt": str(self._train_base_ckpt()),
+            # 训练起点按本次选择的质量档位取底模；老 run 没有 quality 时走 mid。
+            "init_from": str(self._train_base_ckpt(
+                str((state or {}).get("quality") or "mid"))),
+            "base_ckpt": str(self._train_base_ckpt(
+                str((state or {}).get("quality") or "mid"))),
             "current_ckpt": str(self._pipeline.paths.get("ddsp_ckpt") or ""),
             "has_accompaniment": bool(((state or {}).get("data") or {}).get("has_accompaniment")),
             "preview_src": str((state or {}).get("preview_src") or self._default_preview_src() or ""),
@@ -1122,6 +1197,165 @@ class MusicSynthPlugin(NekoPluginBase):
         if resumed:
             self.logger.info("已恢复 %d 个训练任务", len(resumed))
         return resumed
+
+    # ------------------------------------------------------------------
+    # 「翻唱 → 原创」训练串联
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _read_chain(run_dir: Path) -> dict:
+        try:
+            data = json.loads((Path(run_dir) / "chain.json").read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    @staticmethod
+    def _write_chain(run_dir: Path, updates: dict) -> dict:
+        path = Path(run_dir) / "chain.json"
+        chain: dict = {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                chain = data
+        except (OSError, ValueError):
+            chain = {}
+        chain.update(updates or {})
+        chain["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        runtime._atomic_write(path, chain)
+        return chain
+
+    def _start_ace_train_sync(self, name: str, models: list,
+                              epochs: int = 0, rank: int = 0,
+                              alpha: int = 0, batch: int = 0, accum: int = 0,
+                              max_duration: float = 0.0) -> tuple[str, str]:
+        """Call the async ACE trainer from a plain thread; returns (job_id, error)."""
+        try:
+            res = asyncio.run(self.ms_ace_train(
+                name=name, models=list(models or []),
+                epochs=int(epochs or 0), rank=int(rank or 0),
+                alpha=int(alpha or 0), batch=int(batch or 0),
+                gradient_accumulation=int(accum or 0),
+                max_duration=float(max_duration or 0.0)))
+            payload = getattr(res, "value", None)
+            if not isinstance(payload, dict):
+                payload = getattr(res, "data", None)
+            if not isinstance(payload, dict):
+                payload = res if isinstance(res, dict) else {}
+        except Exception as exc:  # noqa: BLE001
+            return "", f"{type(exc).__name__}: {exc}"
+        if not isinstance(payload, dict) or not payload.get("ok") or not payload.get("job_id"):
+            return "", str((payload or {}).get("error") or "原创训练没能开始")
+        return str(payload["job_id"]), ""
+
+    def _watch_train_chain(self, run_id: str) -> None:
+        """Wait for the cover run to finish, then start ACE LoRA training.
+
+        The cover run is launched with ``auto=True`` by ms_train_start when
+        ace_models is present, so it finalizes the best checkpoint itself and
+        ends as ``finished``.  Stopped/failed runs abort the chain.
+        """
+        run_dir = self._train_run_dir(run_id)
+        if not run_dir.is_dir():
+            return
+        chain = self._read_chain(run_dir)
+        if not chain or chain.get("done"):
+            return
+        deadline = time.time() + 7 * 24 * 3600
+        # 1) 等翻唱结束
+        while time.time() < deadline:
+            if getattr(self, "_shutdown", False):
+                return
+            chain = self._read_chain(run_dir) or chain
+            if chain.get("done"):
+                return
+            state = runtime.read_training_state(run_dir) or {}
+            phase = str(state.get("phase") or "")
+            if phase == "finished" and not state.get("stopped_at"):
+                break
+            if phase in ("failed", "stopped") or state.get("stopped_at"):
+                self._write_chain(run_dir, {
+                    "state": "aborted", "done": True,
+                    "error": state.get("error") or "翻唱训练被停止/失败，未继续原创训练"})
+                return
+            time.sleep(5)
+        else:
+            self._write_chain(run_dir, {"state": "timeout", "done": True,
+                                        "error": "等待翻唱训练完成超时"})
+            return
+
+        # 2) 启动 ACE 训练（如果上次重载丢在排队阶段，这里会重新起）
+        chain = self._read_chain(run_dir) or chain
+        job_id = str(chain.get("ace_job_id") or "")
+        if not job_id:
+            self._write_chain(run_dir, {"state": "ace_queued"})
+            job_id, error = self._start_ace_train_sync(
+                str(chain.get("ace_name") or ""), list(chain.get("ace_models") or []),
+                int(chain.get("ace_epochs") or 0), int(chain.get("ace_rank") or 0),
+                int(chain.get("ace_alpha") or 0), int(chain.get("ace_batch") or 0),
+                int(chain.get("ace_accum") or 0),
+                float(chain.get("ace_max_duration") or 0.0))
+            if not job_id:
+                self._write_chain(run_dir, {"state": "failed", "done": True,
+                                            "error": error or "原创训练没能开始"})
+                return
+            self._write_chain(run_dir, {"state": "ace_running", "ace_job_id": job_id})
+        else:
+            self._write_chain(run_dir, {"state": "ace_running"})
+
+        # 3) 跟到 ACE 训练结束，把结果写回 chain（页面据此显示）
+        restarts = 0
+        while time.time() < deadline:
+            if getattr(self, "_shutdown", False):
+                return
+            with self._jobs_lock:
+                found = job_id in self._jobs
+                job = dict(self._jobs.get(job_id) or {})
+            if not found:
+                # 插件重载会带走内存里的 ACE 任务：重新起一次（最多两次）
+                if restarts >= 2:
+                    self._write_chain(run_dir, {"state": "failed", "done": True,
+                                                "error": "原创训练任务丢失，重试后仍未完成"})
+                    return
+                restarts += 1
+                job_id, error = self._start_ace_train_sync(
+                    str(chain.get("ace_name") or ""), list(chain.get("ace_models") or []),
+                    int(chain.get("ace_epochs") or 0), int(chain.get("ace_rank") or 0),
+                    int(chain.get("ace_alpha") or 0), int(chain.get("ace_batch") or 0),
+                    int(chain.get("ace_accum") or 0),
+                    float(chain.get("ace_max_duration") or 0.0))
+                if not job_id:
+                    self._write_chain(run_dir, {"state": "failed", "done": True,
+                                                "error": error})
+                    return
+                self._write_chain(run_dir, {"state": "ace_running", "ace_job_id": job_id})
+                continue
+            state_name = str(job.get("state") or "")
+            if state_name in ("done", "failed"):
+                self._write_chain(run_dir, {
+                    "state": "done" if state_name == "done" else "failed",
+                    "done": True,
+                    "ace_detail": str(job.get("detail") or ""),
+                    "error": "" if state_name == "done" else str(job.get("detail") or ""),
+                    "lora_paths": job.get("lora_paths") or [],
+                })
+                return
+            time.sleep(5)
+
+    def _resume_train_chains(self) -> int:
+        """Restart chain watchers after a plugin reload."""
+        root = self._train_runs_root()
+        resumed = 0
+        try:
+            dirs = [d for d in root.iterdir() if d.is_dir()]
+        except OSError:
+            return 0
+        for d in dirs:
+            chain = self._read_chain(d)
+            if chain and not chain.get("done"):
+                self._thread(f"ms-chain-{d.name}", self._watch_train_chain, d.name)
+                resumed += 1
+        return resumed
+
 
     def _train_inputs(self, inputs, audio_base64, name: str) -> tuple[list, str]:
         """Normalise the requested inputs into paths on disk.
@@ -1224,6 +1458,9 @@ class MusicSynthPlugin(NekoPluginBase):
                 "best_step": advice.get("best_step") or state.get("best_step"),
                 "best_val": advice.get("best_val_loss") or state.get("best_val_loss"),
             }
+        chain = self._read_chain(run_dir)
+        if chain:
+            view["chain"] = chain
         return view
 
     @plugin_entry(id="ms_train_start", name="为她而唱 · 训练新音色",
@@ -1245,19 +1482,73 @@ class MusicSynthPlugin(NekoPluginBase):
                                      "description": "里程碑步数，默认 1000/2000/4000/…"},
                       "steps": {"type": "integer", "minimum": 4000, "maximum": 200000,
                                 "description": "总步数；不传按素材自动算（上限 30000），30000 以上可自定义继续"},
+                      "quality": {"type": "string", "enum": ["low", "mid", "high"],
+                                  "description": "翻唱训练质量档位；不同档位使用对应底模，并在显存不足时提醒"},
                       "from_corpus": {"type": "boolean",
                                       "description": "从语料库取材训练（质检后切片），而非直接上传素材"},
                       "auto": {"type": "boolean",
                                "description": "全自动：到里程碑不停下来等选择，按防过拟合建议自动继续/停止，"
-                                              "停止后用现有收尾后端保留最佳步（不切换当前模型）"}}})
+                                              "停止后用现有收尾后端保留最佳步（不切换当前模型）"},
+                      "ace_models": {"type": "array", "items": {"type": "string"},
+                                     "description": "翻唱训练完成后接着训练的 ACE 底模列表；传了就自动跑完翻唱并保存最佳节点"},
+                      "ace_name": {"type": "string",
+                                   "description": "原创歌曲音色的名字（留空沿用翻唱训练的名字）"},
+                      "ace_epochs": {"type": "integer", "minimum": 0, "maximum": 100},
+                      "ace_rank": {"type": "integer", "minimum": 0, "maximum": 128},
+                      "ace_alpha": {"type": "integer", "minimum": 0, "maximum": 256},
+                      "ace_batch": {"type": "integer", "minimum": 0, "maximum": 8},
+                      "ace_accum": {"type": "integer", "minimum": 0, "maximum": 32},
+                      "ace_max_duration": {"type": "number"}}})
     async def ms_train_start(self, inputs=None, audio_base64: str = "", name: str = "",
                              has_accompaniment=False, preview_src: str = "",
                              init_from: str = "", milestones=None, auto=False,
-                             steps: int = 0, from_corpus=False, **_):
+                             steps: int = 0, quality: str = "mid", from_corpus=False,
+                             ace_models=None, ace_name: str = "",
+                             ace_epochs: int = 0, ace_rank: int = 0,
+                             ace_alpha: int = 0, ace_batch: int = 0,
+                             ace_accum: int = 0, ace_max_duration: float = 0.0, **_):
         # init_from 只为兼容旧面板而保留；训练起点固定走内置底模，传什么都会被忽略。
         problems = self._train_ready()
         if problems:
             return Ok({"ok": False, "error": "训练后端还没就绪，缺少 " + "、".join(problems)})
+        quality = str(quality or "mid").strip().lower()
+        if quality not in ("low", "mid", "high"):
+            quality = "mid"
+        qplan = {
+            "low": {"label": "低", "vram": 4.0, "steps": 12000},
+            "mid": {"label": "中", "vram": 6.0, "steps": 24000},
+            "high": {"label": "高", "vram": 10.0, "steps": 40000},
+        }[quality]
+        quality_warnings = []
+        try:
+            probe = runtime.probe_hardware(force=False) or {}
+            vram_total = float((probe.get("gpu") or {}).get("total_gib") or 0.0)
+        except Exception:  # noqa: BLE001
+            vram_total = 0.0
+        if vram_total and vram_total + 0.5 < qplan["vram"]:
+            quality_warnings.append(
+                f"{qplan['label']}质量建议 ≥{qplan['vram']:.0f}GB 显存，当前只有 "
+                f"{vram_total:.1f}GB；可能很慢或显存不足")
+        try:
+            free_gb = shutil.disk_usage(str(self._train_runs_root())).free / 1024 ** 3
+        except OSError:
+            free_gb = 0.0
+        if free_gb and free_gb < 5.0:
+            quality_warnings.append(
+                f"训练盘只剩 {free_gb:.1f}GB，建议先清理出 5GB 以上")
+        quality_base = self._train_base_ckpt(quality)
+        if not quality_base.is_file():
+            return Ok({"ok": False,
+                       "error": f"{qplan['label']}质量档位的训练底模不存在：{quality_base}"})
+        # 「翻唱 → 原创」串联：传了 ace_models 就必须让翻唱自动跑完并保留最佳节点，
+        # 否则翻唱会停在 awaiting_choice，后面的原创训练永远等不到。
+        if isinstance(ace_models, str):
+            ace_models_list = [Path(ace_models).name] if ace_models.strip() else []
+        elif isinstance(ace_models, (list, tuple)):
+            ace_models_list = [Path(str(m)).name for m in ace_models if str(m).strip()]
+        else:
+            ace_models_list = []
+        auto = _as_bool(auto) or bool(ace_models_list)
         # 语料库取材：从 corpus/index.json 收集质检通过切片，作为训练素材。
         from_corpus = _as_bool(from_corpus)
         if from_corpus:
@@ -1357,8 +1648,8 @@ class MusicSynthPlugin(NekoPluginBase):
             interval = 2000 if steps_total <= 30000 else 5000
             milestone_list = list(range(interval, steps_total + 1, interval))
         milestone_list.sort()
-        # 训练起点固定为内置底模 6.3，不再接受用户/调用方指定（init_from 参数被忽略）。
-        base_ckpt = self._train_base_ckpt()
+        # 训练起点按质量档位取底模（low/mid/high）；init_from 仍只做兼容。
+        base_ckpt = self._train_base_ckpt(quality)
         if not base_ckpt.is_file():
             return Ok({"ok": False, "error": "训练组件缺失，请重新安装唱歌程序"})
         init_choice = str(base_ckpt)
@@ -1370,7 +1661,7 @@ class MusicSynthPlugin(NekoPluginBase):
                 "total_sec": 0, "dropped": [], "has_accompaniment": _as_bool(has_accompaniment),
             },
             "previews": [], "advice": {}, "speed": {"steps_per_sec": None},
-            "pid": None, "error": "", "init_from": init_choice,
+            "pid": None, "error": "", "init_from": init_choice, "quality": quality,
             "auto": _as_bool(auto), "best_step": None, "best_val_loss": None,
             "steps_total": steps_total, "pause_at": steps_total, "from_corpus": from_corpus,
             "live": {"step": 0, "base_step": 0, "batch": 0, "batch_per_s": None,
@@ -1387,9 +1678,29 @@ class MusicSynthPlugin(NekoPluginBase):
             state["error"] = f"{type(exc).__name__}: {exc}"
             runtime._atomic_write(run_dir / "state.json", state)
             return Ok({"ok": False, "error": state["error"], "run_id": run_id})
+        if ace_models_list:
+            chain = {
+                "ace_models": ace_models_list,
+                "ace_name": str(ace_name or clean_name),
+                "ace_epochs": max(0, min(100, int(ace_epochs or 0))),
+                "ace_rank": max(0, min(128, int(ace_rank or 0))),
+                "ace_alpha": max(0, min(256, int(ace_alpha or 0))),
+                "ace_batch": max(0, min(8, int(ace_batch or 0))),
+                "ace_accum": max(0, min(32, int(ace_accum or 0))),
+                "ace_max_duration": max(0.0, min(240.0, float(ace_max_duration or 0.0))),
+                "state": "waiting_cover",
+                "ace_job_id": "",
+                "error": "",
+                "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "done": False,
+            }
+            runtime._atomic_write(run_dir / "chain.json", chain)
+            self._thread(f"ms-chain-{run_id}", self._watch_train_chain, run_id)
         return Ok({"ok": True, "run_id": run_id, "dir": str(run_dir), "name": clean_name,
+                   "quality": quality, "warnings": quality_warnings,
                    "inputs": [c["copied"] for c in copied], "pid": info.get("pid"),
-                   "auto": _as_bool(auto)})
+                   "auto": _as_bool(auto), "ace_models": ace_models_list})
 
     @plugin_entry(id="ms_train_runs", name="为她而唱 · 训练任务列表",
                   description="列出所有训练任务（正在训练 / 等你选择 / 已结束）",
@@ -1969,8 +2280,14 @@ class MusicSynthPlugin(NekoPluginBase):
             silence_s=_as_float(silence_s, 1.2, 0.3, 10.0))
         return Ok(result)
 
-    def _background_process(self, track_id: str, kind: str = "track") -> str:
-        """Run the full chain for one track on its own thread; returns job_id."""
+    def _background_process(self, track_id: str, kind: str = "track",
+                            force: bool = False) -> str:
+        """Run the full chain for one track on its own thread; returns job_id.
+
+        ``force=False`` resumes from whatever steps already succeeded (used by
+        「继续唱」 after a plugin reload); ``force=True`` redoes everything from
+        separation (used by 「重新唱一遍」).
+        """
         job_id = self._job_begin(kind)
         probe = runtime.probe_hardware(force=True)
         paths = self._pipeline.paths
@@ -1986,7 +2303,8 @@ class MusicSynthPlugin(NekoPluginBase):
             with self._process_lock:
                 self._job_update(job_id, state="running", detail="")
                 try:
-                    result = self._pipeline.process_track(track_id, plan)
+                    result = self._pipeline.process_track(
+                        track_id, plan, resume=not force)
                     self._job_update(job_id, state="done" if result.get("ok") else "failed",
                                      progress=100, detail=result.get("error") or "完成")
                 except Exception as exc:  # noqa: BLE001
@@ -1995,17 +2313,42 @@ class MusicSynthPlugin(NekoPluginBase):
         self._thread(f"ms-{kind}-{track_id}", run)
         return job_id
 
+    def _auto_resume_tracks(self, track_ids: list) -> None:
+        """Resume interrupted ACE「生成并让她唱」tracks after a plugin reload."""
+        # 等启动收尾（宿主配置、路径重新解析都完成）再动 GPU，避免和启动抢资源。
+        time.sleep(3.0)
+        for track_id in track_ids:
+            if getattr(self, "_shutdown", False):
+                return
+            track = self._pipeline.store.get(track_id)
+            if not track or str(track.get("status") or "") == "done":
+                continue
+            try:
+                self.logger.info("自动续跑被中断的原创歌曲：%s", track.get("title") or track_id)
+                self._background_process(track_id, kind="resume")
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("自动续跑失败（%s）：%s", track_id, exc)
+
     @plugin_entry(id="ms_process_track", name="为她而唱 · 处理单曲",
-                  description="对指定曲目跑完整链路：分离 → 变声 → 混音；后台执行",
+                  description="对指定曲目跑完整链路：分离 → 变声 → 混音；后台执行（可从中断处继续）",
                   input_schema={"type": "object", "properties": {
-                      "track_id": {"type": "string"}}})
-    async def ms_process_track(self, track_id: str = "", **_):
+                      "track_id": {"type": "string"},
+                      "force": {"type": "boolean",
+                                "description": "true=从头重唱；false=复用已完成的步骤"},
+                      "post_engine": {"type": "string", "enum": ["", "ddsp", "soulx", "soulx_ddsp"],
+                                      "description": "本次变声引擎；留空沿用曲目记录"}}})
+    async def ms_process_track(self, track_id: str = "", force: bool = False,
+                               post_engine: str = "", **_):
         track = self._pipeline.store.get(track_id)
         if not track:
             return Ok({"ok": False, "error": "曲目不存在"})
-        job_id = self._background_process(track_id)
+        engine = str(post_engine or "").strip().lower()
+        if engine in ("ddsp", "soulx", "soulx_ddsp"):
+            self._pipeline.store.update(track_id, post_engine=engine)
+            track = self._pipeline.store.get(track_id) or track
+        job_id = self._background_process(track_id, force=_as_bool(force))
         return Ok({"ok": True, "started": True, "job_id": job_id, "track_id": track_id,
-                   "tier": self._pipeline.last_plan})
+                   "resumed": not _as_bool(force), "tier": self._pipeline.last_plan})
 
     def _now_playing(self) -> dict:
         """Standalone now-playing: Windows media session, no 为她所听 needed."""
@@ -2298,6 +2641,11 @@ class MusicSynthPlugin(NekoPluginBase):
         if not track:
             return Ok({"ok": False, "error": "曲目不存在"})
         target = (track.get("artifacts") or {}).get("final") or ""
+        if not target and str(track.get("origin") or "") == "ace":
+            # 「只生成」的原创曲还没有 final，直接试听 ACE 生成的原曲
+            src = str(track.get("source") or "")
+            if src and Path(src).is_file():
+                target = src
         path = Path(target) if target else None
         if not path or not path.is_file():
             return Ok({"ok": False, "error": "这首还没有成品"})
@@ -3867,21 +4215,300 @@ class MusicSynthPlugin(NekoPluginBase):
             "output": Path(self._pipeline.work_dir) / "ace",
         }
 
-    def _ace_loras(self) -> list:
-        """Installed ACE voice adapters under <compute_root>/acestep/loras."""
-        base = self._ace_paths()["root"] / "loras"
+    ACE_MODEL_DEFAULT = "acestep-v15-turbo"
+    # XL 是 4B DiT；turbo 8 步、sft/base 50 步。面板按显存给推荐项。
+    ACE_MODEL_CHOICES = (
+        "acestep-v15-turbo",
+        "acestep-v15-xl-turbo",
+        "acestep-v15-xl-sft",
+        "acestep-v15-xl-base",
+        "acestep-v15-sft",
+        "acestep-v15-base",
+    )
+    # 面板「生成模型」用的目录：每个模型能提升什么、需要多少显存、下载多大。
+    ACE_MODEL_CATALOG = (
+        {"name": "acestep-v15-turbo", "family": "2B", "steps": 8,
+         "quality": "很高", "diversity": "中", "vram_min_gb": 6,
+         "download_gb": 4.6,
+         "gains": ["速度最快（8 步）", "官方质量：Very High"],
+         "best_for": "日常快速出歌"},
+        {"name": "acestep-v15-sft", "family": "2B", "steps": 50,
+         "quality": "高", "diversity": "中", "vram_min_gb": 8,
+         "download_gb": 4.6,
+         "gains": ["提示词跟随更准", "支持 CFG 引导"],
+         "best_for": "想让风格更贴描述"},
+        {"name": "acestep-v15-base", "family": "2B", "steps": 50,
+         "quality": "中", "diversity": "高", "vram_min_gb": 8,
+         "download_gb": 4.6,
+         "gains": ["多样性最高", "支持 extract / lego / complete 编辑"],
+         "best_for": "想多试几种风格"},
+        {"name": "acestep-v15-xl-turbo", "family": "4B", "steps": 8,
+         "quality": "很高", "diversity": "中", "vram_min_gb": 12,
+         "download_gb": 18.6,
+         "gains": ["4B 参数，伴奏层次和整体音质更高", "仍是 8 步，速度快"],
+         "best_for": "想要更高音质的默认选择"},
+        {"name": "acestep-v15-xl-sft", "family": "4B", "steps": 50,
+         "quality": "最高", "diversity": "中", "vram_min_gb": 16,
+         "download_gb": 18.6,
+         "gains": ["4B + 50 步 + CFG", "官方最高质量，表情和细节更好"],
+         "best_for": "追求最高音质，能等"},
+        {"name": "acestep-v15-xl-base", "family": "4B", "steps": 50,
+         "quality": "高", "diversity": "高", "vram_min_gb": 16,
+         "download_gb": 18.6,
+         "gains": ["4B 全能编辑", "extract / lego / complete"],
+         "best_for": "要提取、分层或补全"},
+    )
+
+    def _ace_catalog(self) -> list:
+        models = set(self._ace_models())
+        try:
+            gpu = (runtime.probe_hardware(force=False) or {}).get("gpu") or {}
+            vram = float(gpu.get("total_gib") or 0.0)
+        except Exception:  # noqa: BLE001
+            vram = 0.0
         rows = []
+        for item in self.ACE_MODEL_CATALOG:
+            row = dict(item)
+            row["downloaded"] = row["name"] in models
+            row["vram_ok"] = (not vram) or (vram + 0.5) >= float(row["vram_min_gb"])
+            row["recommended"] = (
+                (vram >= 24 and row["name"] == "acestep-v15-xl-sft")
+                or (12 <= vram < 24 and row["name"] == "acestep-v15-xl-turbo")
+                or (0 < vram < 12 and row["name"] == "acestep-v15-turbo"))
+            rows.append(row)
+        return rows
+
+    @staticmethod
+    def _ace_model_ready(model_dir: Path) -> bool:
+        """A DiT checkpoint is usable when config + every indexed shard exist."""
+        try:
+            d = Path(model_dir)
+            if not (d / "config.json").is_file():
+                return False
+            single = d / "model.safetensors"
+            if single.is_file():
+                return single.stat().st_size > 0
+            idx = d / "model.safetensors.index.json"
+            if not idx.is_file():
+                return False
+            data = json.loads(idx.read_text(encoding="utf-8"))
+            shards = set((data.get("weight_map") or {}).values())
+            return bool(shards) and all(
+                (d / s).is_file() and (d / s).stat().st_size > 0 for s in shards)
+        except (OSError, ValueError):
+            return False
+
+    def _ace_models(self) -> list:
+        """Downloaded DiT checkpoints under <compute_root>/acestep/checkpoints."""
+        base = self._ace_paths()["checkpoints"]
+        rows = []
+        if base.is_dir():
+            for d in sorted(base.iterdir()):
+                if (d.is_dir() and d.name.startswith("acestep-v15-")
+                        and self._ace_model_ready(d)):
+                    rows.append(d.name)
+        return rows
+
+    def _ace_selected_model(self, requested: str = "") -> str:
+        """Pick the requested/configured model, falling back to a downloaded one."""
+        raw = self._pipeline.paths.get("raw") or {}
+        raw_name = str(requested or raw.get("ace_model") or self.ACE_MODEL_DEFAULT).strip()
+        name = Path(raw_name).name if raw_name else self.ACE_MODEL_DEFAULT
+        base = self._ace_paths()["checkpoints"]
+        if self._ace_model_ready(base / name):
+            return name
+        if self._ace_model_ready(base / self.ACE_MODEL_DEFAULT):
+            return self.ACE_MODEL_DEFAULT
+        models = self._ace_models()
+        return models[0] if models else name
+
+    ACE_LORA_SUFFIXES = ("xl_turbo", "xl_sft", "xl_base", "turbo", "sft", "base")
+    ACE_LORA_ORDER = {
+        "acestep-v15-turbo": 0, "acestep-v15-sft": 1, "acestep-v15-base": 2,
+        "acestep-v15-xl-turbo": 3, "acestep-v15-xl-sft": 4, "acestep-v15-xl-base": 5,
+    }
+
+    def _soulx_paths(self) -> dict:
+        root = Path(str(self._pipeline.paths.get("compute_root") or self._data_dir))
+        raw = self._pipeline.paths.get("raw") or {}
+        return {
+            "root": root / "soulx",
+            "python": root / "envs" / "soulx" / "Scripts" / "python.exe",
+            "repo": root / "soulx" / "repo",
+            "models": root / "soulx" / "models",
+            "preprocess": root / "soulx" / "preprocess",
+            "model": root / "soulx" / "models" / "model-svc.pt",
+            "config": root / "soulx" / "repo" / "soulxsinger" / "config" / "soulxsinger.yaml",
+            "rmvpe": root / "soulx" / "preprocess" / "rmvpe" / "rmvpe.pt",
+            "timbre": Path(str(raw.get("timbre_path") or "")),
+        }
+
+    def _soulx_problems(self) -> list:
+        p = self._soulx_paths()
+        problems = []
+        for key, label in (("python", "SoulX 运行环境 envs\soulx"),
+                           ("model", "SoulX SVC 权重 model-svc.pt"),
+                           ("config", "SoulX 配置 soulxsinger.yaml"),
+                           ("rmvpe", "SoulX RMVPE 音高模型")):
+            if not Path(p[key]).is_file():
+                problems.append(label)
+        if not Path(p["repo"]).is_dir():
+            problems.append("SoulX 代码仓库")
+        if not Path(p["timbre"]).is_file():
+            problems.append("音色样本 timbre_path")
+        return problems
+
+    @plugin_entry(id="ms_soulx_status", name="为她而唱 · SoulX 环境",
+                  description="只读：检查 SoulX-Singer SVC 的代码、权重、音高模型和音色样本",
+                  input_schema={"type": "object", "properties": {}})
+    async def ms_soulx_status(self, **_):
+        p = self._soulx_paths()
+        problems = self._soulx_problems()
+        return Ok({"ok": not problems, "ready": not problems,
+                   "problems": problems,
+                   "paths": {k: str(v) for k, v in p.items()}})
+
+    @plugin_entry(id="ms_soulx_install", name="为她而唱 · 安装 SoulX-Singer",
+                  description="下载 SoulX-SVC 权重、RMVPE 与运行环境（后台；可断点续传）",
+                  input_schema={"type": "object", "properties": {}})
+    async def ms_soulx_install(self, **_):
+        if not self._pipeline.paths.get("configured"):
+            return Ok({"ok": False,
+                       "error": "还没有选择安装位置，请先到安装向导/设置里选一个目录"})
+        p = self._soulx_paths()
+        if not self._soulx_problems():
+            return Ok({"ok": True, "already": True, "ready": True})
+        with self._jobs_lock:
+            for jid, job in self._jobs.items():
+                if job.get("job") == "soulx-install" and job.get("state") in ("queued", "running"):
+                    return Ok({"ok": True, "job_id": jid, "running": True})
+        try:
+            Path(p["root"]).mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return Ok({"ok": False, "error": f"无法创建目录：{exc}"})
+        py_launcher = shutil.which("py")
+        base_python = (py_launcher + " -3.10") if py_launcher else "py -3.10"
+        job_id = self._job_begin("soulx-install")
+        status_path = Path(p["root"]) / "install_status.json"
+        job = {
+            "root": str(p["root"]),
+            "pylibs": str(self._ace_paths()["pylibs"]),
+            "venv": str(Path(p["python"]).parents[1]),
+            "base_python": base_python,
+        }
+
+        def run():
+            stop = threading.Event()
+
+            def watch():
+                last = (-1, "")
+                while not stop.wait(2.0):
+                    try:
+                        st = json.loads(status_path.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        continue
+                    pct = int(st.get("pct") or 0)
+                    detail = str(st.get("detail") or "")
+                    if (pct, detail) != last:
+                        last = (pct, detail)
+                        self._job_update(job_id, state="running",
+                                         progress=pct, detail=detail)
+
+            watcher = threading.Thread(target=watch, daemon=True)
+            watcher.start()
+            try:
+                result = runtime.run_worker(
+                    Path(str(self._pipeline.paths["synth_python"])),
+                    self._train_worker("soulx_install_worker.py"),
+                    job, cwd=Path(p["root"]), timeout=21600,
+                    log_path=Path(p["root"]) / "install_worker.log")
+            except Exception as exc:  # noqa: BLE001
+                self._job_update(job_id, state="failed", progress=100,
+                                 detail=f"{type(exc).__name__}: {exc}")
+                return
+            finally:
+                stop.set()
+            if result.get("ok"):
+                self._job_update(job_id, state="done", progress=100,
+                                 detail="SoulX-Singer 安装完成")
+            else:
+                self._job_update(job_id, state="failed", progress=100,
+                                 detail=str(result.get("error") or "SoulX 安装失败"))
+
+        self._thread(f"ms-soulx-install-{job_id}", run)
+        return Ok({"ok": True, "job_id": job_id})
+
+    def _ace_loras(self) -> list:
+        """Installed ACE voices, grouped by name.
+
+        Multi-model training appends a per-base suffix (梦梦op_turbo /
+        梦梦op_xl_turbo).  The panel shows one card per voice; the variant is
+        picked by the currently selected generation model.
+        """
+        base = self._ace_paths()["root"] / "loras"
+        groups: dict[str, list] = {}
         if not base.is_dir():
-            return rows
+            return []
         for d in sorted(base.iterdir()):
             if not d.is_dir():
                 continue
             has = any((d / f).is_file() for f in (
                 "adapter_config.json", "adapter_model.bin",
                 "adapter_model.safetensors"))
-            if has:
-                rows.append({"name": d.name, "path": str(d)})
+            if not has:
+                continue
+            adapter_base = ""
+            try:
+                adapter = json.loads(
+                    (d / "adapter_config.json").read_text(encoding="utf-8"))
+                adapter_base = Path(str(
+                    adapter.get("base_model_name_or_path") or "")).name
+            except (OSError, ValueError):
+                adapter_base = ""
+            stem = d.name
+            for suffix in self.ACE_LORA_SUFFIXES:
+                if stem.endswith("_" + suffix):
+                    stem = stem[: -len(suffix) - 1]
+                    break
+            groups.setdefault(stem, []).append({
+                "name": d.name, "path": str(d), "base": adapter_base})
+        rows = []
+        for name, variants in sorted(groups.items()):
+            variants.sort(key=lambda v: (
+                self.ACE_LORA_ORDER.get(str(v.get("base") or ""), 9),
+                str(v.get("name") or "")))
+            rows.append({
+                "name": name,
+                "path": variants[0]["path"],
+                "base": variants[0]["base"],
+                "bases": [v["base"] for v in variants],
+                "variants": variants,
+            })
         return rows
+
+    def _ace_lora_group(self, name: str) -> dict | None:
+        needle = Path(str(name or "").strip()).name
+        if not needle:
+            return None
+        rows = self._ace_loras()
+        for row in rows:
+            if row["name"] == needle:
+                return row
+        # 兼容旧数据/AI 直接传变体目录名
+        for row in rows:
+            for variant in row["variants"]:
+                if variant["name"] == needle:
+                    return row
+        return None
+
+    @staticmethod
+    def _ace_lora_variant(group: dict | None, model: str) -> dict | None:
+        if not group:
+            return None
+        for variant in group.get("variants") or []:
+            if variant.get("base") == model:
+                return variant
+        return None
 
     def _ace_train_stats(self) -> dict:
         """素材切片 + 总时长，用于动态推荐训练参数。"""
@@ -3971,8 +4598,9 @@ class MusicSynthPlugin(NekoPluginBase):
         """ACE 训练素材固定来自「准备素材」语料库里已处理的切片。"""
         return self._ace_train_stats()["clips"]
 
-    def _ace_problems(self) -> list:
+    def _ace_problems(self, model: str = "") -> list:
         p = self._ace_paths()
+        model = model or self._ace_selected_model()
         problems = []
         if not p["python"].is_file():
             problems.append("ACE 运行环境（DDSP 的 Python）")
@@ -3980,15 +4608,17 @@ class MusicSynthPlugin(NekoPluginBase):
             problems.append("ACE 依赖目录 acestep\\pylibs")
         else:
             for pkg in ("transformers", "diffusers", "loguru", "accelerate",
-                        "win32_setctime", "peft"):
+                        "win32_setctime", "peft", "vector_quantize_pytorch"):
                 if not (p["pylibs"] / pkg).exists():
                     problems.append(f"ACE 依赖 {pkg}")
                     break
         if not (self._plugin_dir / "acestep" / "__init__.py").is_file():
             problems.append("ACE-Step 代码 acestep/")
-        for key in ("acestep-v15-turbo", "Qwen3-Embedding-0.6B", "vae"):
+        for key in ("Qwen3-Embedding-0.6B", "vae"):
             if not (p["checkpoints"] / key).is_dir():
                 problems.append(f"ACE 模型 {key}")
+        if not self._ace_model_ready(p["checkpoints"] / model):
+            problems.append(f"ACE 模型 {model}")
         if not self._train_worker("ace_worker.py").is_file():
             problems.append("workers\\ace_worker.py")
         return problems
@@ -4022,12 +4652,191 @@ class MusicSynthPlugin(NekoPluginBase):
                   input_schema={"type": "object", "properties": {}})
     async def ms_ace_status(self, **_):
         p = self._ace_paths()
-        problems = self._ace_problems()
+        model = self._ace_selected_model()
+        problems = self._ace_problems(model)
+        try:
+            gpu = (runtime.probe_hardware(force=False) or {}).get("gpu") or {}
+            vram = float(gpu.get("total_gib") or 0.0)
+        except Exception:  # noqa: BLE001
+            vram = 0.0
+        recommended = ("acestep-v15-xl-sft" if vram >= 24
+                       else "acestep-v15-xl-turbo" if vram >= 12
+                       else self.ACE_MODEL_DEFAULT)
+        with self._jobs_lock:
+            active_jobs = {
+                str(jid): dict(j)
+                for jid, j in self._jobs.items()
+                if j.get("job") in ("ace", "ace-download")
+                and j.get("state") in ("queued", "running")
+            }
         return Ok({"ok": not problems, "ready": not problems, "problems": problems,
                    "paths": {k: str(v) for k, v in p.items()},
+                   "model": model,
+                   "model_default": self.ACE_MODEL_DEFAULT,
+                   "model_recommended": recommended,
+                   "model_choices": list(self.ACE_MODEL_CHOICES),
+                   "model_catalog": self._ace_catalog(),
+                   "models": self._ace_models(),
+                   "jobs": active_jobs,
+                   "ace_lora": str((self._pipeline.paths.get("raw") or {})
+                                   .get("ace_lora") or ""),
                    "loras": self._ace_loras(),
                    "train_clips": len(self._ace_train_clips()),
                    "train_defaults": self._ace_train_recommend()})
+
+    @plugin_entry(id="ms_ace_download", name="为她而唱 · 下载 ACE 模型",
+                  description="下载指定的 ACE-Step DiT 模型到计算目录（后台；XL 约 18.6GB，可断点续传）",
+                  input_schema={"type": "object", "properties": {
+                      "model": {"type": "string",
+                                "description": "例如 acestep-v15-xl-turbo"},
+                      "force": {"type": "boolean",
+                                "description": "配置不够时仍然安装"}}})
+    async def ms_ace_download(self, model: str = "", force=False, **_):
+        if not self._pipeline.paths.get("configured"):
+            return Ok({"ok": False,
+                       "error": "还没有选择安装位置，请先到安装向导/设置里选一个目录"})
+        p = self._ace_paths()
+        name = Path(str(model or "").strip()).name
+        if not name.startswith("acestep-v15-"):
+            return Ok({"ok": False,
+                       "error": "模型名不对，例如 acestep-v15-xl-turbo"})
+        if self._ace_model_ready(p["checkpoints"] / name):
+            return Ok({"ok": True, "already": True, "model": name})
+        if not p["python"].is_file():
+            return Ok({"ok": False, "error": f"找不到 DDSP 环境的 Python：{p['python']}"})
+        # 安装前先看她这台电脑：显存/磁盘不够就提示，允许用户执意继续。
+        meta = next((m for m in self.ACE_MODEL_CATALOG
+                     if m["name"] == name), None)
+        warnings = []
+        vram_total = 0.0
+        disk_free_gb = 0.0
+        if meta:
+            try:
+                gpu = (runtime.probe_hardware(force=True) or {}).get("gpu") or {}
+                vram_total = float(gpu.get("total_gib") or 0.0)
+            except Exception:  # noqa: BLE001
+                vram_total = 0.0
+            need_disk = float(meta.get("download_gb") or 0.0) * 1.08
+            try:
+                disk_free_gb = shutil.disk_usage(str(p["root"])).free / 1024 ** 3
+            except OSError:
+                disk_free_gb = 0.0
+            if vram_total and (vram_total + 0.5) < float(meta["vram_min_gb"]):
+                warnings.append(
+                    f"这台电脑显存 {vram_total:.1f}GB，低于 {name} 建议的 "
+                    f"{meta['vram_min_gb']}GB，生成时可能跑不动或很慢")
+            if disk_free_gb and disk_free_gb < need_disk:
+                warnings.append(
+                    f"安装盘只剩 {disk_free_gb:.1f}GB，这个模型约需 "
+                    f"{need_disk:.1f}GB")
+            if disk_free_gb and disk_free_gb < 1.5:
+                return Ok({"ok": False,
+                           "error": f"安装盘空间不足：只剩 {disk_free_gb:.1f}GB",
+                           "disk_free_gb": round(disk_free_gb, 1)})
+        if warnings and not _as_bool(force):
+            return Ok({"ok": False, "need_confirm": True, "model": name,
+                       "warnings": warnings, "vram_total_gb": round(vram_total, 1),
+                       "vram_min_gb": (meta or {}).get("vram_min_gb"),
+                       "disk_free_gb": round(disk_free_gb, 1),
+                       "warning": "；".join(warnings)})
+        job_id = self._job_begin("ace-download")
+        _src = str((self._pipeline.paths.get("raw") or {})
+                   .get("download_source") or "").strip().lower()
+        # 面板里的 "mirror" 对应上游的 modelscope 源（国内更快）。
+        prefer_source = "modelscope" if _src in ("mirror", "modelscope") else (
+            "huggingface" if _src == "huggingface" else "")
+        job = {
+            "plugin_dir": str(self._plugin_dir),
+            "pylibs": str(p["pylibs"]),
+            "checkpoints": str(p["checkpoints"]),
+            "model": name,
+            "prefer_source": prefer_source,
+        }
+
+        def run():
+            self._job_update(job_id, state="running", progress=5,
+                             detail=f"正在下载 {name}（XL 约 18.6GB，可断点续传）")
+            # snapshot_download 不往外报进度，这里按目标目录的实际体积估算，
+            # 面板的进度条才有东西可以走。
+            stop_watch = threading.Event()
+            target_dir = p["checkpoints"] / name
+            expected = float((meta or {}).get("download_gb") or 0.0) * (1024 ** 3)
+
+            def watch_download():
+                last = -1
+                while not stop_watch.wait(2.0):
+                    try:
+                        cur = sum(f.stat().st_size for f in target_dir.rglob("*")
+                                  if f.is_file())
+                    except OSError:
+                        cur = 0
+                    if expected <= 0:
+                        continue
+                    pct = max(5, min(95, int(5 + 90 * cur / expected)))
+                    if pct == last:
+                        continue
+                    last = pct
+                    self._job_update(
+                        job_id, progress=pct,
+                        detail=(f"正在下载 {name}：{cur / 1024 ** 3:.1f} / "
+                                f"{expected / 1024 ** 3:.1f} GB"))
+
+            watcher = threading.Thread(target=watch_download,
+                                       name="ms-ace-download-watch", daemon=True)
+            watcher.start()
+            try:
+                result = runtime.run_worker(
+                    p["python"], self._train_worker("ace_download_worker.py"),
+                    job, cwd=p["checkpoints"], timeout=21600,
+                    log_path=self._pipeline.log_path)
+            except Exception as exc:  # noqa: BLE001
+                self._job_update(job_id, state="failed", progress=100,
+                                 detail=f"{type(exc).__name__}: {exc}")
+                return
+            finally:
+                stop_watch.set()
+            if result.get("ok"):
+                self._job_update(job_id, state="done", progress=100,
+                                 detail=result.get("message") or f"{name} 下载完成")
+            else:
+                self._job_update(job_id, state="failed", progress=100,
+                                 detail=result.get("error") or "下载失败")
+
+        self._thread(f"ms-ace-download-{job_id}", run)
+        return Ok({"ok": True, "job_id": job_id, "model": name})
+
+    @plugin_entry(id="ms_ace_delete_model", name="为她而唱 · 删除 ACE 模型",
+                  description="把已下载的 ACE 模型移进回收站（不会动当前正在用的模型）",
+                  input_schema={"type": "object", "properties": {
+                      "model": {"type": "string",
+                                "description": "例如 acestep-v15-xl-sft"}}})
+    async def ms_ace_delete_model(self, model: str = "", **_):
+        p = self._ace_paths()
+        name = Path(str(model or "").strip()).name
+        if not name.startswith("acestep-v15-"):
+            return Ok({"ok": False, "error": "模型名不对，例如 acestep-v15-xl-sft"})
+        target = p["checkpoints"] / name
+        if not target.is_dir():
+            return Ok({"ok": False, "error": f"没有找到模型 {name}"})
+        current = self._ace_selected_model("")
+        if name == current:
+            return Ok({"ok": False,
+                       "error": f"{name} 是当前正在用的模型；先切到别的模型再删"})
+        with self._jobs_lock:
+            busy = any(
+                j.get("job") in ("ace", "ace-download")
+                and j.get("state") in ("queued", "running")
+                for j in self._jobs.values())
+        if busy:
+            return Ok({"ok": False, "error": "还有生成/下载任务在跑，等它结束再删"})
+        trash = p["checkpoints"].parent / "_trash_models"
+        try:
+            trash.mkdir(parents=True, exist_ok=True)
+            dest = trash / f"{name}_{int(time.time())}"
+            shutil.move(str(target), str(dest))
+        except OSError as exc:
+            return Ok({"ok": False, "error": f"删除失败：{exc}"})
+        return Ok({"ok": True, "model": name, "trash": str(dest)})
 
     @plugin_entry(id="ms_ace_generate", name="为她而唱 · 原创歌曲",
                   description="用 ACE-Step text2music 按风格描述+歌词生成整首歌；可选 auto_sing 直接走现有变声链路",
@@ -4039,22 +4848,41 @@ class MusicSynthPlugin(NekoPluginBase):
                       "bpm": {"type": "integer", "description": "0=自动"},
                       "language": {"type": "string", "enum": ["auto", "zh", "ja", "en", "ko", "unknown"]},
                       "instrumental": {"type": "boolean"},
-                      "auto_sing": {"type": "boolean", "description": "生成后直接用当前音色唱"},
-                      "inference_steps": {"type": "integer", "minimum": 1, "maximum": 60},
+                      "auto_sing": {"type": "boolean", "description": "生成后直接用当前音色唱（未选 ACE LoRA 时）"},
+                      "post_sing": {"type": "boolean", "description": "兼容旧面板：等于 post_engine=ddsp"},
+                      "post_engine": {"type": "string", "enum": ["", "ddsp", "soulx", "soulx_ddsp"],
+                                      "description": "干声后处理引擎：空=不处理，ddsp=翻唱声音，soulx=SoulX-Singer SVC，soulx_ddsp=SoulX 后接 DDSP（保气音）"},
+                      "model": {"type": "string",
+                                "description": "DiT 模型名；留空=用设置里的当前模型（turbo 8 步，XL/sft/base 50 步）"},
+                      "inference_steps": {"type": "integer", "minimum": 0, "maximum": 60,
+                                          "description": "0=按模型自动（turbo 8，sft/base 50）"},
                       "guidance_scale": {"type": "number"},
                       "seed": {"type": "integer"},
+                      "candidates": {"type": "integer", "minimum": 1, "maximum": 6,
+                                     "description": "一次生成几个候选（1-6）；多候选会自动挑频谱最平衡的一条，其余留在「让她唱歌」里试听"},
                       "lora": {"type": "string", "description": "ACE 音色 LoRA 名字；留空=默认音色"}}})
     async def ms_ace_generate(self, prompt: str = "", lyrics: str = "", name: str = "",
                               duration: int = 0, bpm: int = 0, language: str = "auto",
-                              instrumental=False, auto_sing=False,
-                              inference_steps: int = 12, guidance_scale: float = 7.0,
-                              seed: int = -1, lora: str = "", **_):
+                              instrumental=False, auto_sing=False, post_sing=False,
+                              post_engine: str = "",
+                              model: str = "", inference_steps: int = 0,
+                              guidance_scale: float = 7.0,
+                              seed: int = -1, candidates: int = 1,
+                              lora: str = "", **_):
         if not self._pipeline.paths.get("configured"):
             return Ok({"ok": False,
                        "error": "还没有选择安装位置，请先到安装向导/设置里选一个目录"})
-        problems = self._ace_problems()
+        if str(model or "").strip():
+            wanted = Path(str(model).strip()).name
+            if not self._ace_model_ready(self._ace_paths()["checkpoints"] / wanted):
+                return Ok({"ok": False,
+                           "error": f"ACE 模型还没下载：{wanted}",
+                           "model": wanted, "models": self._ace_models()})
+        model_name = self._ace_selected_model(model)
+        problems = self._ace_problems(model_name)
         if problems:
-            return Ok({"ok": False, "error": "原创生成还没就绪，缺少 " + "、".join(problems)})
+            return Ok({"ok": False, "error": "原创生成还没就绪，缺少 " + "、".join(problems),
+                       "model": model_name, "models": self._ace_models()})
         prompt = str(prompt or "").strip()
         lyrics = str(lyrics or "").strip()
         if not prompt and not lyrics:
@@ -4081,24 +4909,102 @@ class MusicSynthPlugin(NekoPluginBase):
             lang = "unknown"
         p = self._ace_paths()
         lora_name = str(lora or "").strip()
+        if not lora_name:
+            # 没显式传音色时，用「我的声音」里设的当前原创音色
+            lora_name = str((self._pipeline.paths.get("raw") or {})
+                            .get("ace_lora") or "").strip()
         lora_path = ""
         if lora_name:
-            cand = p["root"] / "loras" / lora_name
-            if not cand.is_dir():
-                return Ok({"ok": False, "error": f"找不到 ACE 音色：{lora_name}"})
-            lora_path = str(cand)
-        # 选了 ACE 音色时，ACE 唱出来就是目标音色，不再走 DDSP 二次变声。
-        sing_after = _as_bool(auto_sing) and not lora_path
+            group = self._ace_lora_group(lora_name)
+            if group:
+                variant = self._ace_lora_variant(group, model_name)
+                if not variant:
+                    return Ok({"ok": False,
+                               "error": (f"原创音色「{group['name']}」没有 {model_name} 版本；"
+                                         f"它支持：{'、'.join(group.get('bases') or [])}"),
+                               "name": group["name"],
+                               "bases": group.get("bases") or []})
+                lora_name = str(variant["name"])
+                lora_path = str(variant["path"])
+            else:
+                cand = p["root"] / "loras" / lora_name
+                if not cand.is_dir():
+                    return Ok({"ok": False, "error": f"找不到 ACE 音色：{lora_name}"})
+                # 兼容旧调用：直接传的是变体目录名，仍按底模校验
+                base_name = ""
+                try:
+                    adapter = json.loads(
+                        (cand / "adapter_config.json").read_text(encoding="utf-8"))
+                    base_name = Path(str(
+                        adapter.get("base_model_name_or_path") or "")).name
+                except (OSError, ValueError):
+                    base_name = ""
+                if base_name and base_name != model_name:
+                    return Ok({"ok": False,
+                               "error": (f"ACE 音色「{lora_name}」是在 {base_name} 上训练的，"
+                                         f"不能直接用在 {model_name} 上；请换回 {base_name}，"
+                                         "或用它重新训练一个音色")})
+                lora_path = str(cand)
+        # 后处理引擎：空=不处理；ddsp=现有翻唱变声；soulx=SoulX-Singer SVC。
+        # 旧面板的 post_sing=true 等价于 ddsp。
+        engine = str(post_engine or "").strip().lower()
+        if engine not in ("", "ddsp", "soulx", "soulx_ddsp"):
+            return Ok({"ok": False, "error": f"未知后处理引擎：{post_engine}"})
+        if _as_bool(post_sing) and not engine:
+            engine = "ddsp"
+        if engine in ("soulx", "soulx_ddsp"):
+            sx = self._soulx_problems()
+            if sx:
+                return Ok({"ok": False,
+                           "error": "SoulX 还没就绪，缺少 " + "、".join(sx)})
+        # 普通 auto_sing 在选了 ACE 音色时仍然跳过 DDSP 二次变声；
+        # 显式 post_engine 则一定后处理。
+        sing_after = bool(engine) or (_as_bool(auto_sing) and not lora_path)
+        try:
+            inference_steps = int(inference_steps or 0)
+        except (TypeError, ValueError):
+            inference_steps = 0
+        if inference_steps <= 0:
+            inference_steps = 8 if "turbo" in model_name else 50
+        inference_steps = max(1, min(60, inference_steps))
+        is_xl = "xl" in model_name
+        if is_xl:
+            # ACE-Step v0.1.8 的 CPU offload 对 4B XL 会原生崩溃（Windows/CUDA，
+            # 关 DCW 也一样）；实测 16GB 卡关掉 offload 后 10s/60s/180s 峰值约
+            # 11.3GB，可稳定跑。低于 12GB 的卡不建议选 XL。
+            try:
+                gpu = (runtime.probe_hardware(force=False) or {}).get("gpu") or {}
+                total_vram = float(gpu.get("total_gib") or 0.0)
+            except Exception:  # noqa: BLE001
+                total_vram = 0.0
+            if total_vram and (total_vram + 0.5) < 12.0:
+                return Ok({"ok": False,
+                           "error": (f"XL 模型至少需要 12GB 显存（当前 {total_vram:.1f}GB）；"
+                                     "请改用 2B 的 acestep-v15-turbo"),
+                           "model": model_name})
         try:
             p["output"].mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             return Ok({"ok": False, "error": f"无法创建生成目录：{exc}"})
+        try:
+            n_candidates = max(1, min(6, int(candidates or 1)))
+        except (TypeError, ValueError):
+            n_candidates = 1
+        fixed_seed = int(seed or -1)
+        if n_candidates > 1 and fixed_seed >= 0:
+            # 指定 seed 时连续取 N 个，保证可复现；否则交给 ACE 随机抽。
+            cand_seeds = [fixed_seed + i for i in range(n_candidates)]
+            cand_random = False
+        else:
+            cand_seeds = None
+            cand_random = fixed_seed < 0
         job_id = self._job_begin("ace")
         job = {
             "plugin_dir": str(self._plugin_dir),
             "project_root": str(p["root"]),
             "pylibs": str(p["pylibs"]),
             "output_dir": str(p["output"]),
+            "model_name": model_name,
             "lora_path": lora_path,
             "prompt": prompt,
             "lyrics": lyrics,
@@ -4107,11 +5013,18 @@ class MusicSynthPlugin(NekoPluginBase):
             "duration": duration,
             "bpm": bpm or None,
             "instrumental": _as_bool(instrumental),
-            "inference_steps": max(1, min(60, int(inference_steps or 12))),
+            "inference_steps": inference_steps,
             "guidance_scale": float(guidance_scale or 7.0),
-            "seed": int(seed or -1),
+            "seed": fixed_seed,
+            # 面板填了 seed 就一直用它；-1/留空才随机。旧代码没传这个字段，
+            # AceStepGenerateRequest 默认 True，导致 seed 参数完全失效。
+            "use_random_seed": cand_random,
+            "batch_size": n_candidates,
+            "seeds": cand_seeds,
+            # v0.1.8 的 offload_dit_to_cpu 在 4B XL 上会原生崩溃；
+            # 只开 offload_to_cpu 既能避开崩溃，又会跳过 VRAM 预检（275s 实测可跑）。
             "offload_to_cpu": True,
-            "offload_dit_to_cpu": True,
+            "offload_dit_to_cpu": not is_xl,
         }
 
         def run():
@@ -4146,9 +5059,42 @@ class MusicSynthPlugin(NekoPluginBase):
                     self._job_update(job_id, state="failed", progress=100,
                                      detail=f"入库失败：{exc}")
                     return
+                # 记下来源：插件重载打断「生成并让她唱」后，启动时据此自动续跑。
+                if track and track.get("id"):
+                    track = self._pipeline.store.update(
+                        str(track["id"]), origin="ace",
+                        auto_sing=bool(sing_after), post_engine=engine,
+                        ace_job=job_id) or track
+                # 多候选：没被自动选中的也入库，用户可以在「让她唱歌」里试听后再决定。
+                for idx, audio_path in enumerate(result.get("audios") or []):
+                    if str(audio_path) == str(wav):
+                        continue
+                    try:
+                        extra = self._pipeline.store.add(
+                            title=f"{clean_name} · 候选 {idx + 1}",
+                            source=str(audio_path), duration_s=None)
+                        if extra and extra.get("id"):
+                            self._pipeline.store.update(
+                                str(extra["id"]), origin="ace", auto_sing=False,
+                                post_engine=engine, status="done",
+                                step="generate", progress=100, error="")
+                    except Exception:  # noqa: BLE001 - 候选入库失败不影响主流程
+                        pass
+                if n_candidates > 1:
+                    self._job_update(
+                        job_id, detail=(f"{n_candidates} 个候选已生成，自动选第 "
+                                        f"{int(result.get('best') or 0) + 1} 个进入后续流程"))
                 if not (sing_after and track and track.get("id")):
+                    # 「只生成」也是完成状态：面板显示「做好啦」，并可直接试听原曲
+                    if track and track.get("id"):
+                        self._pipeline.store.update(
+                            str(track["id"]), status="done", step="generate",
+                            progress=100, error="")
                     self._job_update(job_id, state="done", progress=100,
-                                     detail="生成完成：" + clean_name,
+                                     detail=("生成完成：" + clean_name
+                                             + (f"（{n_candidates} 个候选，自动选第 "
+                                                f"{int(result.get('best') or 0) + 1} 个）"
+                                                if n_candidates > 1 else "")),
                                      track_id=track.get("id"))
                     return
                 # 「生成并让她唱」：同一个任务继续跑分离→变声→混音，
@@ -4191,7 +5137,8 @@ class MusicSynthPlugin(NekoPluginBase):
 
         self._thread(f"ms-ace-{job_id}", run)
         return Ok({"ok": True, "job_id": job_id, "name": clean_name,
-                   "duration": duration, "language": lang})
+                   "duration": duration, "language": lang,
+                   "model": model_name, "inference_steps": inference_steps})
 
     @plugin_entry(id="ms_ace_job", name="为她而唱 · 原创生成进度",
                   description="查询一次原创生成任务的状态",
@@ -4207,27 +5154,213 @@ class MusicSynthPlugin(NekoPluginBase):
     async def ms_ace_loras(self, **_):
         return Ok({"ok": True, "loras": self._ace_loras()})
 
+    @plugin_entry(id="ms_ace_set_lora", name="为她而唱 · 设为当前原创音色",
+                  description="把某个原创歌曲音色设为默认；生成时按所选模型自动挑对应变体",
+                  input_schema={"type": "object", "properties": {
+                      "name": {"type": "string"}}})
+    async def ms_ace_set_lora(self, name: str = "", **_):
+        group = self._ace_lora_group(name)
+        if not group:
+            return Ok({"ok": False, "error": f"找不到原创音色：{name}"})
+        runtime.save_config(self._data_dir, {"ace_lora": group["name"]})
+        self._reload_paths()
+        return Ok({"ok": True, "name": group["name"],
+                   "bases": group.get("bases") or []})
+
+    @plugin_entry(id="ms_ace_delete_lora", name="为她而唱 · 删除原创音色",
+                  description="把某个原创歌曲音色的所有底模变体移进回收站",
+                  input_schema={"type": "object", "properties": {
+                      "name": {"type": "string"},
+                      "delete_files": {"type": "boolean"}}})
+    async def ms_ace_delete_lora(self, name: str = "", delete_files=True, **_):
+        group = self._ace_lora_group(name)
+        if not group:
+            return Ok({"ok": False, "error": f"找不到原创音色：{name}"})
+        if not _as_bool(delete_files):
+            return Ok({"ok": False,
+                       "error": "原创音色没有单独的记录表，只能连文件一起删除（会移进回收站）"})
+        moved = []
+        for variant in group.get("variants") or []:
+            res = self._trash_move(Path(str(variant.get("path") or "")),
+                                   hash_file=False)
+            if res.get("ok"):
+                moved.append(variant.get("name"))
+        if str((self._pipeline.paths.get("raw") or {}).get("ace_lora") or "") \
+                == group["name"]:
+            runtime.save_config(self._data_dir, {"ace_lora": ""})
+            self._reload_paths()
+        return Ok({"ok": bool(moved), "name": group["name"], "deleted": moved,
+                   "error": "" if moved else "没有可删除的文件"})
+
+    @plugin_entry(id="ms_ace_export_lora", name="为她而唱 · 导出原创音色",
+                  description="把某个原创歌曲音色的所有底模变体打包成 zip，放到导出目录",
+                  input_schema={"type": "object", "properties": {
+                      "name": {"type": "string"}}})
+    async def ms_ace_export_lora(self, name: str = "", **_):
+        group = self._ace_lora_group(name)
+        if not group:
+            return Ok({"ok": False, "error": f"找不到原创音色：{name}"})
+
+        def build() -> dict:
+            import zipfile
+            safe = re.sub(r'[\\/:*?"<>|\s]+', "_", group["name"])[:50] or "ace_voice"
+            out = self._exports_dir() / f"{safe}.zip"
+            with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+                for variant in group.get("variants") or []:
+                    folder = Path(str(variant.get("path") or ""))
+                    if not folder.is_dir():
+                        continue
+                    for f in folder.rglob("*"):
+                        if f.is_file():
+                            zf.write(
+                                f,
+                                arcname=(f"{group['name']}/{folder.name}/"
+                                         f"{f.relative_to(folder).as_posix()}"))
+            return {"ok": True, "name": group["name"], "path": str(out),
+                    "size_mb": round(out.stat().st_size / 1024 / 1024, 1)}
+
+        return Ok(await asyncio.to_thread(build))
+
+    @plugin_entry(id="ms_ace_preview", name="为她而唱 · 试听原创音色",
+                  description="用这个原创音色生成一段 10 秒试听（首次较慢，之后走缓存）",
+                  input_schema={"type": "object", "properties": {
+                      "name": {"type": "string"},
+                      "model": {"type": "string"}}})
+    async def ms_ace_preview(self, name: str = "", model: str = "", **_):
+        group = self._ace_lora_group(name)
+        if not group:
+            return Ok({"ok": False, "error": f"找不到原创音色：{name}"})
+        target_model = str(model or "").strip() or self._ace_selected_model()
+        variant = self._ace_lora_variant(group, target_model)
+        if not variant:
+            variants = group.get("variants") or []
+            variant = variants[0] if variants else None
+        if not variant:
+            return Ok({"ok": False, "error": "这个音色没有可用的 LoRA 文件"})
+        p = self._ace_paths()
+        if not p["python"].is_file():
+            return Ok({"ok": False, "error": f"找不到 ACE 运行环境：{p['python']}"})
+        import hashlib
+        try:
+            mtime = Path(str(variant["path"])).stat().st_mtime
+        except OSError:
+            mtime = 0
+        key = hashlib.sha1(
+            f"{variant['path']}|{mtime}|{variant['base']}".encode("utf-8")
+        ).hexdigest()[:12]
+        out_dir = Path(self._pipeline.work_dir) / "ace"
+        out = out_dir / f"preview_{key}.wav"
+        if not out.is_file():
+            try:
+                out_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                return Ok({"ok": False, "error": f"无法创建试听目录：{exc}"})
+            is_xl = "xl" in str(variant["base"])
+            job = {
+                "plugin_dir": str(self._plugin_dir),
+                "project_root": str(p["root"]),
+                "pylibs": str(p["pylibs"]),
+                "output_dir": str(out_dir),
+                "model_name": str(variant["base"]),
+                "lora_path": str(variant["path"]),
+                "prompt": "warm acoustic pop, piano and strings",
+                "lyrics": "la la la la, hold me close tonight",
+                "name": "ace_preview",
+                "vocal_language": "en",
+                "duration": 10,
+                "bpm": 0,
+                "instrumental": False,
+                "inference_steps": 8 if "turbo" in str(variant["base"]) else 50,
+                "guidance_scale": 7.0,
+                "seed": 12345,
+                "offload_to_cpu": True,
+                "offload_dit_to_cpu": not is_xl,
+                "dcw_enabled": True,
+            }
+            if not self._process_lock.acquire(blocking=False):
+                return Ok({"ok": False,
+                           "error": "正在训练或生成，等它结束再试听"})
+            try:
+                result = await asyncio.to_thread(
+                    lambda: runtime.run_worker(
+                        p["python"], self._train_worker("ace_worker.py"),
+                        job, cwd=out_dir, timeout=1800,
+                        log_path=self._pipeline.log_path))
+            finally:
+                self._process_lock.release()
+            if not result.get("ok") or not result.get("wav"):
+                return Ok({"ok": False,
+                           "error": result.get("error") or "试听生成失败"})
+            generated = Path(str(result["wav"]))
+            if generated != out:
+                try:
+                    shutil.move(str(generated), str(out))
+                except OSError:
+                    out = generated
+        payload = await asyncio.to_thread(self._audio_payload, out)
+        return Ok({"ok": True, "name": group["name"],
+                   "model": str(variant["base"]),
+                   "file": str(out), **payload})
+
     @plugin_entry(id="ms_ace_train", name="为她而唱 · 训练 ACE 音色",
-                  description="用「准备素材」里已处理的切片训练 ACE-Step 音色 LoRA；风格由系统自动判断",
+                  description="用「准备素材」里已处理的切片训练 ACE-Step 音色 LoRA；可传入多个模型，依次排队训练",
                   input_schema={"type": "object", "properties": {
                       "name": {"type": "string", "description": "音色名"},
+                      "models": {"type": "array", "items": {"type": "string"},
+                                 "description": "要训练的底模列表；留空=所有已下载模型依次训练"},
                       "epochs": {"type": "integer", "minimum": 0, "maximum": 100},
                       "rank": {"type": "integer", "minimum": 0, "maximum": 128},
                       "alpha": {"type": "integer", "minimum": 0, "maximum": 256},
                       "batch": {"type": "integer", "minimum": 1, "maximum": 8},
                       "gradient_accumulation": {"type": "integer", "minimum": 1, "maximum": 32},
-                      "max_duration": {"type": "number"}}})
-    async def ms_ace_train(self, name: str = "",
+                      "max_duration": {"type": "number"},
+                      "max_clips": {"type": "integer", "minimum": 0, "maximum": 2000,
+                                    "description": "调试/快速试训：只用前 N 段素材；0=全部"}}})
+    async def ms_ace_train(self, name: str = "", models=None,
                            epochs: int = 0, rank: int = 0, alpha: int = 0,
                            batch: int = 0, gradient_accumulation: int = 0,
-                           max_duration: float = 60.0, **_):
+                           max_duration: float = 60.0, max_clips: int = 0, **_):
         if not self._pipeline.paths.get("configured"):
             return Ok({"ok": False,
                        "error": "还没有选择安装位置，请先到安装向导/设置里选一个目录"})
-        problems = self._ace_problems()
+        # 不同底模的 LoRA 不能混用：2B turbo 的 adapter 挂不到 4B XL 上。
+        # 这里按“每个已下载模型训一个 LoRA”排队，名字后面带变体后缀，避免互相覆盖。
+        aliases = {
+            "acestep-v15-turbo": "turbo",
+            "acestep-v15-base": "base",
+            "acestep-v15-sft": "sft",
+            "acestep-v15-xl-turbo": "xl_turbo",
+            "acestep-v15-xl-base": "xl_base",
+            "acestep-v15-xl-sft": "xl_sft",
+        }
+        available = [m for m in self._ace_models() if m in aliases]
+        if isinstance(models, str):
+            requested = [models]
+        elif isinstance(models, (list, tuple)):
+            requested = [str(m) for m in models if str(m).strip()]
+        else:
+            requested = []
+        requested = [Path(m).name for m in requested]
+        if not requested:
+            requested = available
+        if not requested:
+            return Ok({"ok": False,
+                       "error": "没有可训练的 ACE 模型，请先下载 acestep-v15-turbo 或 XL 模型"})
+        missing = [m for m in requested if m not in available]
+        if missing:
+            return Ok({"ok": False,
+                       "error": "这些模型还没下载完整：" + "、".join(missing),
+                       "models": available})
+        problems = self._ace_problems(requested[0])
         if problems:
             return Ok({"ok": False, "error": "ACE 环境还没就绪，缺少 " + "、".join(problems)})
         clips = self._ace_train_clips()
+        try:
+            max_clips = int(max_clips or 0)
+        except (TypeError, ValueError):
+            max_clips = 0
+        if max_clips > 0:
+            clips = clips[:max_clips]
         count = len(clips)
         if count < 5:
             return Ok({"ok": False,
@@ -4242,13 +5375,12 @@ class MusicSynthPlugin(NekoPluginBase):
         batch = max(1, min(8, int(batch or rec["batch"])))
         accum = max(1, min(32, int(gradient_accumulation or rec["gradient_accumulation"])))
         job_id = self._job_begin("ace-train")
-        job = {
+        job_base = {
             "plugin_dir": str(self._plugin_dir),
             "project_root": str(p["root"]),
             "pylibs": str(p["pylibs"]),
             # 固定通道：直接用「准备素材」语料库里已处理好的切片
             "audio_paths": [str(c) for c in clips],
-            "name": clean_name,
             "epochs": epochs,
             "rank": rank,
             "alpha": alpha,
@@ -4259,38 +5391,68 @@ class MusicSynthPlugin(NekoPluginBase):
             "precision": "bf16",
         }
 
+        def lora_name_for(model_name: str, many: bool) -> str:
+            # 只训一个模型时保持原来的名字；多个模型时加变体后缀区分。
+            return clean_name if not many else f"{clean_name}_{aliases[model_name]}"
+
         def run():
             self._job_update(job_id, state="queued",
-                             detail="排队中：训练会长时间占用显卡")
+                             detail=f"排队中：将依次训练 {len(requested)} 个模型（{', '.join(requested)}）")
             with self._process_lock:
-                self._job_update(job_id, state="running", progress=5,
-                                 detail=f"正在用 {count} 段素材训练「{clean_name}」（首次较久）")
-                try:
-                    result = runtime.run_worker(
-                        p["python"], self._train_worker("ace_train_worker.py"),
-                        job, cwd=p["output"], timeout=21600,
-                        log_path=self._pipeline.log_path)
-                except Exception as exc:  # noqa: BLE001
-                    self._job_update(job_id, state="failed", progress=100,
-                                     detail=f"{type(exc).__name__}: {exc}")
-                    return
-                if not result.get("ok"):
-                    self._job_update(job_id, state="failed", progress=100,
-                                     detail=str(result.get("error") or "ACE 训练失败"))
-                    return
-                caption = str(result.get("caption_zh") or result.get("caption") or "")
-                self._job_update(job_id, state="done", progress=100,
-                                 detail=f"训练完成：「{clean_name}」"
-                                        + (f" · 自动风格：{caption}" if caption else ""),
-                                 lora_path=result.get("lora_path"),
-                                 samples=result.get("samples"))
+                results = []
+                errors = []
+                total = len(requested)
+                for index, model_name in enumerate(requested, 1):
+                    alias = aliases[model_name]
+                    lora_name = lora_name_for(model_name, total > 1)
+                    pct = 5 + int((index - 1) * 90 / total)
+                    self._job_update(
+                        job_id, state="running", progress=pct,
+                        detail=f"排队训练 {index}/{total}：{model_name} → 「{lora_name}」")
+                    job = dict(job_base, name=lora_name,
+                               model_name=model_name, model_alias=alias)
+                    try:
+                        result = runtime.run_worker(
+                            p["python"], self._train_worker("ace_train_worker.py"),
+                            job, cwd=p["output"], timeout=21600,
+                            log_path=self._pipeline.log_path)
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(f"{model_name}：{type(exc).__name__}: {exc}")
+                        continue
+                    if not result.get("ok"):
+                        errors.append(f"{model_name}：{result.get('error') or '训练失败'}")
+                        continue
+                    results.append({
+                        "model": model_name,
+                        "name": lora_name,
+                        "path": result.get("lora_path"),
+                        "caption": str(result.get("caption_zh")
+                                       or result.get("caption") or ""),
+                    })
+                    self._job_update(
+                        job_id, progress=5 + int(index * 90 / total),
+                        detail=f"已完成 {index}/{total}：「{lora_name}」")
+                if results:
+                    detail = (f"训练完成 {len(results)}/{total}："
+                              + "、".join(str(r["name"]) for r in results))
+                    if errors:
+                        detail += "；失败：" + "；".join(errors)[:300]
+                    state = "done"
+                else:
+                    detail = "训练失败：" + "；".join(errors)[:500]
+                    state = "failed"
+                self._job_update(
+                    job_id, state=state, progress=100, detail=detail,
+                    lora_paths=[r["path"] for r in results if r.get("path")],
+                    lora_path=(results[0]["path"] if len(results) == 1 else None),
+                    models=requested, errors=errors)
 
         self._thread(f"ms-ace-train-{job_id}", run)
         return Ok({"ok": True, "job_id": job_id, "name": clean_name,
-                   "samples": count})
+                   "models": requested, "samples": count})
 
     @plugin_entry(id="ms_ace_install", name="为她而唱 · 安装 ACE 依赖",
-                  description="把 ACE 需要的 Python 依赖装到计算根目录的 acestep\\pylibs（模型会在首次生成时自动下载）",
+                  description="把 ACE 需要的 Python 依赖装到计算根目录的 acestep\\pylibs（模型用 ms_ace_download 单独下载）",
                   input_schema={"type": "object", "properties": {}})
     async def ms_ace_install(self, **_):
         if not self._pipeline.paths.get("configured"):
@@ -4306,8 +5468,15 @@ class MusicSynthPlugin(NekoPluginBase):
         job_id = self._job_begin("ace-install")
         packages = [
             "diffusers==0.36.0", "loguru", "accelerate", "win32-setctime",
-            "transformers==4.51.3", "tokenizers==0.21.1", "huggingface_hub==0.30.2",
-            "peft==0.4.0", "psutil",
+            "transformers==4.57.1", "tokenizers==0.22.1", "huggingface_hub==0.36.0",
+            "peft==0.18.0", "psutil",
+            # ACE-Step v0.1.8 的模型代码/训练依赖
+            "vector-quantize-pytorch>=1.27.15", "einx>=0.3.0",
+            "torch-einops-utils>=0.1.42", "frozendict",
+            # DCW 采样校正（v0.1.7+ 默认开启）需要这两个；缺了会自动 no-op
+            "pytorch_wavelets", "PyWavelets", "setuptools<81",
+            # 国内镜像源（download_source=mirror）走 ModelScope
+            "modelscope", "modelscope-hub", "cryptography",
         ]
 
         def run():
@@ -4318,8 +5487,18 @@ class MusicSynthPlugin(NekoPluginBase):
                         "https_proxy", "all_proxy"):
                 env.pop(key, None)
             env["NO_PROXY"] = "*"
+            # pip --target 不会卸载同名旧版本；先清掉这些包的旧 dist-info，
+            # 否则 importlib.metadata 仍可能读到 transformers 4.51 的版本号。
+            stale = {"transformers", "tokenizers", "huggingface_hub", "peft",
+                     "modelscope", "modelscope_hub", "cryptography",
+                     "pytorch_wavelets", "pywavelets", "vector_quantize_pytorch",
+                     "einx", "torch_einops_utils", "frozendict"}
+            for dist in p["pylibs"].glob("*.dist-info"):
+                stem = dist.name.split("-", 1)[0].replace("-", "_").lower()
+                if stem in stale:
+                    shutil.rmtree(dist, ignore_errors=True)
             cmd = [str(p["python"]), "-m", "pip", "install", "--no-deps",
-                   "--target", str(p["pylibs"]), *packages]
+                   "--upgrade", "--target", str(p["pylibs"]), *packages]
             try:
                 proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800,
                                       env=env, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))

@@ -14,7 +14,7 @@ import {
   overfitOf, phaseText, progressText, requirementOf, slotView, totalFileSeconds,
 } from "./trainModel"
 import {
-  BRAND, BRAND_DEEP, INK, INK_2, LINE, AudioBox, Bar, Btn, Col, Empty, Err, FileRow, FoldCard,
+  BRAND, BRAND_DEEP, INK, INK_2, LINE, AudioBox, Bar, Btn, Col, Empty, Err, Field, FileRow, FoldCard,
   Grid, Input, Muted, Panel, PRIMARY_BTN, Pill, Row, Section, Select, Soft, Toggle, fmtEta, fmtTime, DeletePrompt,
 } from "./ui"
 
@@ -60,6 +60,23 @@ export function PageTrain(props: { api: any; snap: any; onRefresh: () => void; o
   const [keepMsg, setKeepMsg] = useState<string>("")
   const [delRun, setDelRun] = useState<boolean>(false)
 
+  // 训练类型：翻唱（DDSP）/ 原创（ACE LoRA），可同时选，翻唱完自动接原创
+  const [doCover, setDoCover] = useState<boolean>(true)
+  const [doAce, setDoAce] = useState<boolean>(false)
+  const [aceStatus, setAceStatus] = useState<any>(null)
+  const [aceJobId, setAceJobId] = useState<string>("")
+  const [aceJob, setAceJob] = useState<any>(null)
+  const [aceEpochs, setAceEpochs] = useState<string>("")
+  const [aceRank, setAceRank] = useState<string>("")
+  const [aceAlpha, setAceAlpha] = useState<string>("")
+  const [aceBatch, setAceBatch] = useState<string>("")
+  const [aceAccum, setAceAccum] = useState<string>("")
+  const [aceMaxDur, setAceMaxDur] = useState<string>("60")
+  const [aceSel, setAceSel] = useState<string[]>([])
+  const [openAceAdv, setOpenAceAdv] = useState<boolean>(false)
+  const aceTouched = useRef<boolean>(false)
+  const aceSelTouched = useRef<boolean>(false)
+
   const [nodeOpen, setNodeOpen] = useState<boolean>(false)
   const [overOpen, setOverOpen] = useState<boolean>(false)
   const nodeSeen = useRef<string>("")
@@ -88,6 +105,9 @@ export function PageTrain(props: { api: any; snap: any; onRefresh: () => void; o
   const prog = progressText(status)
   const milestones = status ? milestoneList(status) : []
   const ready = milestones.filter((m: any) => m.ready)
+  const aceModels = (aceStatus && Array.isArray(aceStatus.models)) ? aceStatus.models : []
+  const chain = (status && status.chain) || null
+  const aceJid = aceJobId || (chain && chain.ace_job_id) || ""
 
   // ---- 训练记录与进度（原来 train.tsx 的节奏不变：4 秒一次） -------------
   const loadRuns = async (keep?: string, keepStep?: boolean) => {
@@ -100,6 +120,8 @@ export function PageTrain(props: { api: any; snap: any; onRefresh: () => void; o
         const list = r.runs as any[]
         const liveRun = list.find((x: any) => x && ACTIVE_PHASES.indexOf(String(x.phase)) >= 0)
           || list.find((x: any) => x && ENDED.indexOf(String(x.phase)) < 0)
+        // 翻唱已经结束、但「翻唱 → 原创」串联还在跑：也要回到第 3 步看链进度。
+        const chainRun = list.find((x: any) => x && x.chain && !x.chain.done)
         // 记住的 run_id 可能已经被删了：只认还存在的，否则会留一个空壳页。
         // 刚点「开始训练」时必须优先用新 run_id（keep）：这里闭包里的 runId 还是旧值，
         // 直接用它会导致新训练页显示上一次训练的模型。
@@ -108,13 +130,13 @@ export function PageTrain(props: { api: any; snap: any; onRefresh: () => void; o
         const keepId = String(keep || "").trim()
         const want = keepId || String(TRAIN_UI.runId || "").trim()
         const remembered = want && ids.indexOf(want) >= 0 ? want : ""
-        const cur = keepId || remembered || (liveRun && liveRun.run_id) || ids[0] || ""
+        const cur = keepId || remembered || (liveRun && liveRun.run_id) || (chainRun && chainRun.run_id) || ids[0] || ""
         setRunId(cur)
         if (cur) TRAIN_UI.maxStep = Math.max(TRAIN_UI.maxStep, 3)
         // 进训练页时：有正在跑的训练就去看它；没有就回到第 1 步准备素材，
         // 不要停在上一轮已经结束的「看着她唱」页面。
         if (!keepStep) {
-          if (liveRun) setStep(3)
+          if (liveRun || chainRun) setStep(3)
           else setStep(1)
         }
         return
@@ -123,6 +145,27 @@ export function PageTrain(props: { api: any; snap: any; onRefresh: () => void; o
     setRuns({ runs: [] })
   }
   useEffect(() => { loadRuns() }, [])
+  useEffect(() => {
+    let alive = true
+    callEntry(api, "ms_ace_status", {}, 30000)
+      .then((r: any) => {
+        if (!alive) return
+        setAceStatus(r)
+        const td = r && r.train_defaults
+        if (td && !aceTouched.current) {
+          setAceEpochs(String(td.epochs || ""))
+          setAceRank(String(td.rank || ""))
+          setAceAlpha(String(td.alpha || ""))
+          setAceBatch(String(td.batch || ""))
+          setAceAccum(String(td.gradient_accumulation || ""))
+        }
+        if (!aceSelTouched.current && r && Array.isArray(r.models)) {
+          setAceSel(r.models.map((m: any) => String(m)))
+        }
+      })
+      .catch(() => {})
+    return () => { alive = false }
+  }, [])
 
   const loadStatus = async (id?: string) => {
     const rid = id || runId
@@ -141,6 +184,31 @@ export function PageTrain(props: { api: any; snap: any; onRefresh: () => void; o
     const id = setInterval(() => loadStatus(runId), 4000)
     return () => clearInterval(id)
   }, [runId])
+
+  // 切页/刷新后从 ms_state 的 jobs 里找回正在跑的原创训练
+  useEffect(() => {
+    if (aceJobId) return
+    const jobs: any = (props.snap && props.snap.jobs) || {}
+    const hit = Object.keys(jobs).find((id: string) => {
+      const j = jobs[id] || {}
+      return j.job === "ace-train" && (j.state === "running" || j.state === "queued")
+    })
+    if (hit) setAceJobId(hit)
+  }, [props.snap])
+
+  // 原创歌曲声音训练的进度（原创单独训练，或翻唱完成后串联的那一段）
+  useEffect(() => {
+    if (!aceJid) { setAceJob(null); return }    let alive = true
+    const tick = async () => {
+      try {
+        const r: any = await callEntry(api, "ms_ace_job", { job_id: aceJid }, 30000)
+        if (alive) setAceJob((r && r.job) || null)
+      } catch (e) { /* 下一拍再试 */ }
+    }
+    tick()
+    const id = setInterval(tick, 4000)
+    return () => { alive = false; clearInterval(id) }
+  }, [aceJid])
 
   // 到了新节点：只弹一次「可以试听」。手动模式会在 awaiting_choice 停下等选择。
   useEffect(() => {
@@ -198,17 +266,67 @@ export function PageTrain(props: { api: any; snap: any; onRefresh: () => void; o
   })
 
   const start = () => run("start", async () => {
-    if (have < need.min) { setMsg({ tone: "error", text: "素材还不够：" + gap }); return }
-    if (stepMode === "custom" && (steps < STEPS_MIN || steps > STEPS_HARD_MAX)) {
+    if (!doCover && !doAce) { setMsg({ tone: "error", text: "先选一种要训练的声音" }); return }
+    if (doCover && have < need.min) { setMsg({ tone: "error", text: "素材还不够：" + gap }); return }
+    if (doCover && stepMode === "custom" && (steps < STEPS_MIN || steps > STEPS_HARD_MAX)) {
       setMsg({ tone: "error", text: "自定义步数要填 " + STEPS_MIN + "～" + STEPS_HARD_MAX + " 之间" })
       return
     }
+    if (doAce && !aceModels.length) {
+      setMsg({ tone: "error", text: "没有可用的原创歌曲模型，请先在「原创歌曲」页下载 ACE 模型" })
+      return
+    }
+    if (doAce && clips.length < 5) {
+      setMsg({ tone: "error", text: "原创歌曲声音训练至少需要 5 段可用切片，先去「准备素材」再投一点" })
+      return
+    }
+    const selectedAce = (aceSelTouched.current ? aceSel : aceModels)
+      .filter((m: string) => aceModels.includes(m))
+    if (doAce && !selectedAce.length) {
+      setMsg({ tone: "error", text: "至少选一个要训练的原创底模" })
+      return
+    }
+    // 只训原创：直接起 ACE LoRA 训练，不占用翻唱训练流程
+    if (!doCover && doAce) {
+      const r: any = await callEntry(api, "ms_ace_train", {
+        name: name.trim() || undefined,
+        models: selectedAce,
+        epochs: Number(aceEpochs) || 0,
+        rank: Number(aceRank) || 0,
+        alpha: Number(aceAlpha) || 0,
+        batch: Number(aceBatch) || 0,
+        gradient_accumulation: Number(aceAccum) || 0,
+        max_duration: Number(aceMaxDur) || 0,
+      }, 60000)
+      if (r && r.ok && r.job_id) {
+        setAceJobId(String(r.job_id))
+        setMsg({ tone: "info", text: "原创歌曲声音训练已开始；进度显示在下面。" })
+      } else {
+        setMsg({ tone: "error", text: "没能开始原创训练：" + ((r && r.error) || "未知错误") })
+      }
+      return
+    }
     const r: any = await callEntry(api, "ms_train_start", {
-      steps, name: name.trim() || undefined, from_corpus: true, auto: false,
+      steps, name: name.trim() || undefined, from_corpus: true,
+      auto: !!doAce,
+      ace_models: doAce ? selectedAce : [],
+      ace_name: doAce ? (name.trim() || undefined) : "",
+      ace_epochs: doAce ? (Number(aceEpochs) || 0) : 0,
+      ace_rank: doAce ? (Number(aceRank) || 0) : 0,
+      ace_alpha: doAce ? (Number(aceAlpha) || 0) : 0,
+      ace_batch: doAce ? (Number(aceBatch) || 0) : 0,
+      ace_accum: doAce ? (Number(aceAccum) || 0) : 0,
+      ace_max_duration: doAce ? (Number(aceMaxDur) || 0) : 0,
     }, 120000)
     if (r && r.ok && r.run_id) {
+      setAceJobId("")
+      setMsg({
+        tone: "info",
+        text: doAce
+          ? "开始训练翻唱声音；完成后会自动保存最佳节点，并接着训练原创歌曲声音。"
+          : "开始训练了。每 2000 步会出试听，到目标步数才停；觉得够像了可以提前「停下来」保存。",
+      })
       setRunId(String(r.run_id))
-      setMsg({ tone: "info", text: "开始训练了。每 2000 步会出试听，到目标步数才停；觉得够像了可以提前「停下来」保存。" })
       setStep(3)
       loadRuns(String(r.run_id), true)
       loadStatus(String(r.run_id))
@@ -265,6 +383,26 @@ export function PageTrain(props: { api: any; snap: any; onRefresh: () => void; o
       })}
     </Row>
   )
+
+  const typeCard = (p: any) => (
+    <button type="button" onClick={() => p.onChange(!p.on)} style={{
+      textAlign: "left", cursor: "pointer", fontFamily: "inherit", width: "100%",
+      border: "1px solid " + (p.on ? "rgba(224,45,118,0.45)" : LINE),
+      background: p.on ? "linear-gradient(135deg,rgba(255,229,239,0.72),#fff)" : "#fff",
+      borderRadius: 18, padding: 16, boxShadow: p.on ? "0 8px 22px rgba(224,45,118,0.10)" : "none",
+    }}>
+      <Row style={{ justifyContent: "space-between", gap: 10 }}>
+        <span style={{ fontSize: 14, fontWeight: 700, color: INK }}>{p.title}</span>
+        <Pill tone={p.on ? "success" : "neutral"}>{p.on ? "已选" : "未选"}</Pill>
+      </Row>
+      <div style={{ fontSize: 12.5, color: INK_2, lineHeight: 1.75, marginTop: 8 }}>{p.desc}</div>
+      {p.extra ? <div style={{ marginTop: 8 }}>{p.extra}</div> : null}
+    </button>
+  )
+  const acePicked = aceSelTouched.current ? aceSel.length : aceModels.length
+  const aceReady = aceModels.length > 0 && clips.length >= 5 && acePicked > 0
+  const startDisabled = !!busy || (!doCover && !doAce)
+    || (doCover && !!gap) || (doAce && !aceReady)
 
   return (
     <Col style={{ gap: 24 }}>
@@ -356,52 +494,184 @@ export function PageTrain(props: { api: any; snap: any; onRefresh: () => void; o
 
       {/* ② 训练设置 */}
       {step === 2 ? (
-        <Panel title="训练设置" extra={<Muted>按这台电脑的显存自动选参数</Muted>}>
-          <Col style={{ gap: 16 }}>
-            <div style={{ fontSize: 13, color: INK_2, lineHeight: 1.85 }}>
-              她会拿已经收好的素材来学（带伴奏的歌会在后台先把人声分出来）。取个名字，以后在「我的声音」里好认。
-            </div>
-            <Row style={{ justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
-              <Muted>训练强度</Muted>
-              <Pill tone="success">{steps} 步 · 等效 batch {effectiveBatch}</Pill>
-            </Row>
-            <Row style={{ gap: 8, flexWrap: "wrap" }}>
-              {STEPS_MODES.map((m: any) => (
-                <Btn key={m.key} style={stepMode === m.key ? PRIMARY_BTN : undefined}
-                     onClick={() => setStepMode(m.key)}>
-                  {m.label} · {m.steps} 步
-                </Btn>
-              ))}
-              <Btn style={stepMode === "custom" ? PRIMARY_BTN : undefined} onClick={() => setCustomOpen(true)}>
-                自定义{stepMode === "custom" ? " · " + customSteps + " 步" : "…"}
-              </Btn>
-            </Row>
-            <Muted>{modeHint}</Muted>
-            <Muted>
-              每 2000 步自动生成一段试听（中间不停），到目标步数才停下来让你确认；之后还能追加步数。
-            </Muted>
-            <Muted>试听会用固定的干声样例（{(((props.snap || {}).engine || {}).preview_src) ? "已配置" : "自动从素材里挑一段"}），每到一个节点合成一段，方便比较像不像。</Muted>
-            <Row style={{ gap: 8 }}>
-              <Muted>音色名字</Muted>
-              <Input value={name} placeholder="例如 小夏（留空按时间自动命名）" style={{ flex: 1, minWidth: 0, maxWidth: 340 }}
-                     onChange={(e: any) => setName(e.target.value)} />
-            </Row>
-            <FoldCard open={openAdv} onToggle={() => setOpenAdv(!openAdv)} title="高级设置（一般不用改）"
-                      sub={<Muted>一共 {steps} 步 · 每 {steps > 30000 ? 5000 : 2000} 步停下来让你试听</Muted>}>
-              <Col style={{ gap: 8 }}>
-                <Muted>步数不是固定的：素材越多，自动算出来的步数越多，练得也更久。</Muted>
-                <Muted>现在这一档的参考：至少 {fmtTime(need.min)} 素材，推荐 {fmtTime(need.rec)}。</Muted>
-              </Col>
-            </FoldCard>
-            <Row style={{ justifyContent: "space-between" }}>
-              <Btn onClick={() => setStep(1)}>上一步</Btn>
-              <Row>
-                <Muted>{gap ? gap + "，可以回去再放一点素材" : "素材够用，随时可以开始"}</Muted>
-                <Btn style={PRIMARY_BTN} disabled={!!busy || !!gap} onClick={start}>{busy === "start" ? "正在开始…" : "开始训练"}</Btn>
+        <Col style={{ gap: 24 }}>
+          <Panel title="训练设置" extra={<Muted>按这台电脑的显存自动选参数</Muted>}>
+            <Col style={{ gap: 18 }}>
+              <div style={{ fontSize: 13, color: INK_2, lineHeight: 1.8 }}>
+                用「准备素材」里的素材来学。可以只训一种，也可以两种一起训。
+              </div>
+              <Grid cols={2} min={260} gap={14}>
+                {typeCard({
+                  on: doCover, onChange: setDoCover,
+                  title: "翻唱的声音",
+                  desc: "学会用她的音色翻唱别人的歌；训练完可在「让她唱歌」里切换。",
+                  extra: <Muted>至少需要 {fmtTime(need.min)} 素材 · 当前 {fmtTime(have)}</Muted>,
+                })}
+                {typeCard({
+                  on: doAce, onChange: setDoAce,
+                  title: "原创歌曲的声音",
+                  desc: "训练 ACE-Step 音色 LoRA；原创生成时直接唱，每个底模各一个。选中后可设置训练轮数和 rank。",
+                  extra: <Muted>{aceModels.length ? "将训练：" + aceModels.join("、") : "还没有可用的 ACE 模型，请先在「原创歌曲」下载"}</Muted>,
+                })}
+              </Grid>
+              {doCover && doAce ? (
+                <Soft style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
+                  <span style={{ color: BRAND_DEEP, fontSize: 15 }}>↳</span>
+                  <Muted>两个都选：先训练翻唱声音，到目标步数自动保存最佳节点，然后自动接着训练原创歌曲声音。</Muted>
+                </Soft>
+              ) : null}
+
+              {doCover ? (
+                <div style={{ padding: 16, borderRadius: 18, border: "1px solid " + LINE, background: "#fff", display: "flex", flexDirection: "column", gap: 12 }}>
+                  <Row style={{ justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+                    <span style={{ fontSize: 13.5, fontWeight: 700, color: INK }}>翻唱训练强度</span>
+                    <Pill tone="success">{steps} 步 · 等效 batch {effectiveBatch}</Pill>
+                  </Row>
+                  <Row style={{ gap: 8, flexWrap: "wrap" }}>
+                    {STEPS_MODES.map((m: any) => (
+                      <Btn key={m.key} style={stepMode === m.key ? PRIMARY_BTN : undefined}
+                           onClick={() => setStepMode(m.key)}>
+                        {m.label} · {m.steps} 步
+                      </Btn>
+                    ))}
+                    <Btn style={stepMode === "custom" ? PRIMARY_BTN : undefined} onClick={() => setCustomOpen(true)}>
+                      自定义{stepMode === "custom" ? " · " + customSteps + " 步" : "…"}
+                    </Btn>
+                  </Row>
+                  <Muted style={{ fontSize: 12 }}>{modeHint}</Muted>
+                  <Muted style={{ fontSize: 12 }}>
+                    每 2000 步自动生成试听，到目标步数才停；{doAce ? "串联模式会自动保存最佳节点，不用手动确认。" : "觉得够像了可以中途停下来保存。"}
+                  </Muted>
+                </div>
+              ) : null}
+
+              {doAce ? (
+                <div style={{ padding: 16, borderRadius: 18, border: "1px solid " + LINE, background: "#fff", display: "flex", flexDirection: "column", gap: 12 }}>
+                  <Row style={{ justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+                    <span style={{ fontSize: 13.5, fontWeight: 700, color: INK }}>原创训练参数</span>
+                    <Pill tone="success">每个底模各训一次</Pill>
+                  </Row>
+                  <Grid cols={2} min={200} gap={14}>
+                    <Field label="训练轮数（1～100）">
+                      <Input type="number" min={1} max={100} step={1} value={aceEpochs}
+                             onChange={(e: any) => { aceTouched.current = true; setAceEpochs(e.target.value) }} />
+                    </Field>
+                    <Field label="LoRA rank（4～128）">
+                      <Input type="number" min={4} max={128} step={4} value={aceRank}
+                             onChange={(e: any) => { aceTouched.current = true; setAceRank(e.target.value) }} />
+                    </Field>
+                  </Grid>
+                  {aceStatus && aceStatus.train_defaults ? (
+                    <Row style={{ flexWrap: "wrap", gap: 8, alignItems: "center" }}>
+                      <Muted>
+                        系统推荐：{aceStatus.train_defaults.epochs} 轮 · rank {aceStatus.train_defaults.rank}
+                        （{aceStatus.train_defaults.reason}）
+                      </Muted>
+                      <Btn onClick={() => {
+                        aceTouched.current = false
+                        setAceEpochs(String(aceStatus.train_defaults.epochs || ""))
+                        setAceRank(String(aceStatus.train_defaults.rank || ""))
+                      }}>恢复推荐</Btn>
+                    </Row>
+                  ) : null}
+                  <Field label="要训练哪些底模">
+                    <Row style={{ flexWrap: "wrap", gap: 8 }}>
+                      {aceModels.map((m: string) => (
+                        <Btn key={m} style={aceSel.includes(m) ? PRIMARY_BTN : undefined}
+                             onClick={() => {
+                               aceSelTouched.current = true
+                               setAceSel((prev: string[]) => prev.includes(m)
+                                 ? prev.filter((x: string) => x !== m)
+                                 : [...prev, m])
+                             }}>
+                          {m}{aceSel.includes(m) ? " · 已选" : ""}
+                        </Btn>
+                      ))}
+                    </Row>
+                  </Field>
+                  <FoldCard open={openAceAdv} onToggle={() => setOpenAceAdv(!openAceAdv)}
+                            title="高级设置（一般不用改）"
+                            sub={<Muted>alpha · batch · 梯度累积 · 单段时长</Muted>}>
+                    <Col style={{ gap: 10 }}>
+                      <Grid cols={4} min={160} gap={12}>
+                        <Field label="LoRA alpha（4～256）">
+                          <Input type="number" min={4} max={256} step={4} value={aceAlpha}
+                                 onChange={(e: any) => { aceTouched.current = true; setAceAlpha(e.target.value) }} />
+                        </Field>
+                        <Field label="batch（1～8）">
+                          <Input type="number" min={1} max={8} step={1} value={aceBatch}
+                                 onChange={(e: any) => { aceTouched.current = true; setAceBatch(e.target.value) }} />
+                        </Field>
+                        <Field label="梯度累积（1～32）">
+                          <Input type="number" min={1} max={32} step={1} value={aceAccum}
+                                 onChange={(e: any) => { aceTouched.current = true; setAceAccum(e.target.value) }} />
+                        </Field>
+                        <Field label="单段最长时长（秒）">
+                          <Input type="number" min={5} max={240} step={5} value={aceMaxDur}
+                                 onChange={(e: any) => { aceTouched.current = true; setAceMaxDur(e.target.value) }} />
+                        </Field>
+                      </Grid>
+                      <Muted>显存紧张时 batch 保持 1，把梯度累积调大；单段时长越长越吃显存。</Muted>
+                    </Col>
+                  </FoldCard>
+                </div>
+              ) : null}
+
+              <Field label="音色名字（留空按时间自动命名）">
+                <Input value={name} placeholder="例如 小夏" onChange={(e: any) => setName(e.target.value)} />
+              </Field>
+
+              <Soft style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                <div style={{ fontSize: 13, fontWeight: 700, color: INK }}>这次会得到</div>
+                {doCover ? <Muted>· 一个翻唱声音，可在「让她唱歌」里切换</Muted> : null}
+                {doAce ? <Muted>· {aceModels.length ? aceModels.join("、") : "（无可用模型）"} 各一个原创音色 LoRA</Muted> : null}
+                {!doCover && !doAce ? <Muted>还没选训练类型</Muted> : null}
+              </Soft>
+
+              <FoldCard open={openAdv} onToggle={() => setOpenAdv(!openAdv)} title="高级设置（一般不用改）"
+                        sub={<Muted>翻唱 {steps} 步 · {doAce ? "原创按模型自动用推荐参数" : "不训练原创"}</Muted>}>
+                <Col style={{ gap: 6 }}>
+                  <Muted>翻唱步数按素材时长和显存自动算；素材越多，步数越多、练得越久。</Muted>
+                  <Muted>这一档参考：至少 {fmtTime(need.min)} 素材，推荐 {fmtTime(need.rec)}。</Muted>
+                  <Muted>原创 LoRA 使用同一批切片；XL 4B 在 16GB 卡上更慢、更吃显存，失败不会影响翻唱。</Muted>
+                </Col>
+              </FoldCard>
+
+              <Row style={{ justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
+                <Btn onClick={() => setStep(1)}>上一步</Btn>
+                <Row style={{ gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                  <Muted>
+                    {!doCover && !doAce ? "先选一种训练"
+                      : doAce && !aceReady ? (aceModels.length ? "原创训练至少需要 5 段可用切片" : "没有可用的 ACE 模型")
+                      : doCover && gap ? gap + "，可以回去再放一点素材"
+                      : "素材够用，随时可以开始"}
+                  </Muted>
+                  <Btn style={PRIMARY_BTN} disabled={startDisabled} onClick={start}>
+                    {busy === "start" ? "正在开始…"
+                      : !doCover && doAce ? "开始训练原创声音"
+                      : doCover && doAce ? "开始训练（翻唱 → 原创）"
+                      : "开始训练"}
+                  </Btn>
+                </Row>
               </Row>
-            </Row>
-          </Col>
-        </Panel>
+            </Col>
+          </Panel>
+
+          {!chain && aceJobId ? (
+            <Panel title="原创歌曲声音训练"
+                   extra={<Pill tone={aceJob && aceJob.state === "done" ? "success" : "warning"}>
+                     {aceJob ? (aceJob.state === "done" ? "完成" : aceJob.state === "failed" ? "失败" : "训练中") : "排队中"}
+                   </Pill>}>
+              <Col style={{ gap: 10 }}>
+                <Bar pct={Number((aceJob && aceJob.progress) || 0)} />
+                <Muted>{aceJob ? (aceJob.detail || "正在准备…") : "正在读取训练进度…"}</Muted>
+                {aceJob && aceJob.state === "done" ? (
+                  <Row><Btn style={PRIMARY_BTN} onClick={() => props.onGo("models")}>去「我的声音」看看</Btn></Row>
+                ) : null}
+              </Col>
+            </Panel>
+          ) : null}
+        </Col>
       ) : null}
 
       {/* ③ 看着她唱 */}
@@ -434,7 +704,7 @@ export function PageTrain(props: { api: any; snap: any; onRefresh: () => void; o
                     </Row>
                   ) : null}
                   {running || phase === "awaiting_choice" ? <Btn disabled={!!busy} onClick={() => control("stop")}>停下来</Btn> : null}
-                  {ENDED.indexOf(phase) >= 0 && ready.length ? <Btn style={PRIMARY_BTN} onClick={() => setStep(4)}>下一步：保存声音</Btn> : null}
+                  {ENDED.indexOf(phase) >= 0 && ready.length && !chain ? <Btn style={PRIMARY_BTN} onClick={() => setStep(4)}>下一步：保存声音</Btn> : null}
                   <Btn onClick={() => loadStatus(runId)}>刷新一下</Btn>
                   {runId ? (
                     <Btn style={{ color: "#c93c3c", borderColor: "rgba(201,60,60,0.28)" }}
@@ -446,6 +716,37 @@ export function PageTrain(props: { api: any; snap: any; onRefresh: () => void; o
               </Col>
             ) : <Empty>还没有训练记录。回到第一步放好素材，就能开始。</Empty>}
           </Panel>
+
+          {chain ? (() => {
+            const cs = String(chain.state || "")
+            const tone = cs === "done" ? "success" : (cs === "failed" || cs === "aborted") ? "error" : "warning"
+            const label = cs === "done" ? "完成" : cs === "failed" || cs === "aborted" ? "未完成"
+              : cs === "ace_running" || cs === "ace_queued" ? "原创训练中" : "等翻唱完成"
+            return (
+              <Panel title="接着训练原创歌曲声音" extra={<Pill tone={tone}>{label}</Pill>}>
+                <Col style={{ gap: 10 }}>
+                  <Muted>
+                    {cs === "waiting_cover"
+                      ? "翻唱完成后会自动开始，训练模型：" + ((chain.ace_models || []).join("、") || "（未指定）")
+                      : cs === "ace_running" || cs === "ace_queued"
+                        ? "翻唱已自动保存，原创歌曲声音训练进行中：" + ((chain.ace_models || []).join("、") || "")
+                        : cs === "done"
+                          ? "原创歌曲声音训练完成：" + ((chain.ace_models || []).join("、") || "")
+                          : (chain.error || "原创训练没有完成")}
+                  </Muted>
+                  {aceJob ? (
+                    <Col style={{ gap: 6 }}>
+                      <Bar pct={Number(aceJob.progress || 0)} />
+                      <Muted>{aceJob.detail || "正在准备…"}</Muted>
+                    </Col>
+                  ) : null}
+                  {cs === "done" ? (
+                    <Row><Btn onClick={() => props.onGo("models")}>去「我的声音」看看</Btn></Row>
+                  ) : null}
+                </Col>
+              </Panel>
+            )
+          })() : null}
 
           <Section title="每个节点的试听" extra={<Muted>节点越大越像她 · 一共 {ready.length} 个听得了</Muted>}>
             {ready.length ? (
@@ -477,7 +778,11 @@ export function PageTrain(props: { api: any; snap: any; onRefresh: () => void; o
 
           <Row style={{ justifyContent: "space-between" }}>
             <Btn onClick={() => setStep(2)}>上一步</Btn>
-            <Btn style={PRIMARY_BTN} disabled={running || !ready.length} onClick={() => setStep(4)}>{running ? "练完这一段再保存声音" : "下一步：保存声音"}</Btn>
+            {chain ? (
+              <Muted>{chain.state === "done" ? "翻唱已自动保存，原创训练也完成了。" : "翻唱已自动保存，等原创训练完成即可。"}</Muted>
+            ) : (
+              <Btn style={PRIMARY_BTN} disabled={running || !ready.length} onClick={() => setStep(4)}>{running ? "练完这一段再保存声音" : "下一步：保存声音"}</Btn>
+            )}
           </Row>
         </Col>
       ) : null}

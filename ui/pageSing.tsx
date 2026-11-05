@@ -100,9 +100,9 @@ export function PageSing(props: { api: any; snap: any; onRefresh: () => void; on
       .catch((e: any) => setNotice({ tone: "error", text: String((e && e.message) || e) }))
   }
 
-  const processTrack = (t: any) => run("proc:" + t.id, async () => {
-    const r = await callEntry(api, "ms_process_track", { track_id: t.id }, 60000)
-    setNotice({ tone: r.ok ? "info" : "error", text: r.ok ? "开始处理：" + (t.title || t.id) : "没能开始：" + (r.error || "") })
+  const processTrack = (t: any, force: boolean) => run("proc:" + t.id, async () => {
+    const r = await callEntry(api, "ms_process_track", { track_id: t.id, force: !!force }, 60000)
+    setNotice({ tone: r.ok ? "info" : "error", text: r.ok ? (force ? "重新唱：" : "接着唱：") + (t.title || t.id) : "没能开始：" + (r.error || "") })
     onRefresh()
   })
 
@@ -321,7 +321,7 @@ export function PageSing(props: { api: any; snap: any; onRefresh: () => void; on
                     {t.playable === false ? <Muted>成品文件不在了</Muted>
                       : art.final ? <Btn disabled={!!busy} onClick={() => preview(t)}>{busy === "audio:" + t.id ? "读取中…" : "试听"}</Btn> : null}
                     {t.status !== "running"
-                      ? <Btn disabled={!!busy} onClick={() => processTrack(t)}>{busy === "proc:" + t.id ? "启动中…" : art.final ? "重新唱一遍" : "让她唱"}</Btn>
+                      ? <Btn disabled={!!busy} onClick={() => processTrack(t, !!art.final)}>{busy === "proc:" + t.id ? "启动中…" : art.final ? "重新唱一遍" : (t.resumable || art.vocal_wav || art.vocal_clean || art.vocals) ? "继续唱" : "让她唱"}</Btn>
                       : null}
                     <Btn disabled={!!busy} onClick={() => identify(t)}>{busy === "id:" + t.id ? "识别中…" : "校准歌名"}</Btn>
                     <Btn style={{ color: "#c93c3c", borderColor: "rgba(201,60,60,0.28)" }} onClick={() => remove(t)}>删除</Btn>

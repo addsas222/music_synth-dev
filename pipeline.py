@@ -177,6 +177,36 @@ class Pipeline:
         d.mkdir(parents=True, exist_ok=True)
         return d
 
+    @staticmethod
+    def _file_ok(value) -> bool:
+        """A path is reusable only when it exists as a non-empty file."""
+        try:
+            p = Path(str(value or ""))
+            return bool(value) and p.is_file() and p.stat().st_size > 0
+        except OSError:
+            return False
+
+    @staticmethod
+    def _newer(path, ref) -> bool:
+        """True when ``path`` was written at/after ``ref`` (1s slack for FAT/NTFS)."""
+        try:
+            return Path(path).stat().st_mtime + 1.0 >= Path(ref).stat().st_mtime
+        except OSError:
+            return False
+
+    @staticmethod
+    def _same_size_class(path, ref) -> bool:
+        """Guard against a half-written stem from an interrupted merge.
+
+        Separation workers write the merged stem only after all chunks succeed,
+        but a kill during that final write can leave a short file.  A same-length
+        PCM stem is within 10% of its input; anything much smaller is not reused.
+        """
+        try:
+            return Path(path).stat().st_size >= Path(ref).stat().st_size * 0.9
+        except OSError:
+            return False
+
     def log_probe(self, probe: dict, plan: dict) -> None:
         """Persist one hardware probe + the plan derived from it."""
         self._log("PROBE " + json.dumps(probe, ensure_ascii=False))
@@ -285,6 +315,7 @@ class Pipeline:
                     "detail": result}
         self._step(track_id, "convert", "done", engine="ddsp", model=ckpt.name,
                    key=job["key"], infer_step=job["infer_step"],
+                   input=str(vocals),
                    duration_s=result.get("duration_s"), peak=result.get("peak"),
                    rms=result.get("rms"))
         self._set(track_id, progress=75,
@@ -294,13 +325,84 @@ class Pipeline:
                   f"peak={result.get('peak')} rms={result.get('rms')}")
         return result
 
+    def _soulx_convert(self, track_id: str, out_dir: Path, vocals: str,
+                       plan: dict) -> dict:
+        """Step 2 alternative: SoulX-Singer SVC on the ACE dry vocal."""
+        raw = self.paths.get("raw") or {}
+        root = Path(str(self.paths.get("compute_root") or ""))
+        python = Path(str(raw.get("soulx_python")
+                          or (root / "envs" / "soulx" / "Scripts" / "python.exe")))
+        repo = Path(str(raw.get("soulx_repo") or (root / "soulx" / "repo")))
+        model = Path(str(raw.get("soulx_model")
+                         or (root / "soulx" / "models" / "model-svc.pt")))
+        config = repo / "soulxsinger" / "config" / "soulxsinger.yaml"
+        rmvpe = Path(str(raw.get("soulx_rmvpe")
+                         or (root / "soulx" / "preprocess" / "rmvpe" / "rmvpe.pt")))
+        timbre = Path(str(raw.get("timbre_path") or ""))
+        problems = []
+        if not python.is_file():
+            problems.append(f"SoulX 环境 {python}")
+        if not (repo / "soulxsinger").is_dir():
+            problems.append(f"SoulX 仓库 {repo}")
+        if not model.is_file():
+            problems.append(f"SoulX 权重 {model}")
+        if not config.is_file():
+            problems.append(f"SoulX 配置 {config}")
+        if not rmvpe.is_file():
+            problems.append(f"RMVPE 音高模型 {rmvpe}")
+        if not timbre.is_file():
+            problems.append(f"音色样本 {timbre}")
+        if problems:
+            message = ("缺少 " + "、".join(problems)
+                       + "；请先安装 SoulX-Singer")
+            self._step(track_id, "convert", "failed", error=message)
+            self._set(track_id, status="failed", progress=60, error=message)
+            return {"ok": False, "step": "convert", "error": message}
+
+        out = out_dir / "convert"
+        out.mkdir(parents=True, exist_ok=True)
+        self._step(track_id, "convert", "running", engine="soulx",
+                   device=plan.get("device"))
+        job = {
+            "repo": str(repo),
+            "model_path": str(model),
+            "config_path": str(config),
+            "rmvpe_path": str(rmvpe),
+            "prompt_wav": str(timbre),
+            "target_wav": str(vocals),
+            "out_dir": str(out),
+            "device": "cuda" if str(plan.get("device", "cuda")).startswith("cuda") else "cpu",
+            "n_steps": 32,
+            "cfg": 3.0,
+            "fp16": True,
+        }
+        self._log(f"[{track_id}] SoulX-SVC: {timbre.name} -> {Path(vocals).name}")
+        result = runtime.run_worker(
+            python, self.workers / "soulx_svc_worker.py", job,
+            cwd=out, timeout=3600, log_path=self.log_path)
+        if not result.get("ok"):
+            self._step(track_id, "convert", "failed", error=result.get("error"))
+            self._set(track_id, status="failed", progress=60,
+                      error=result.get("error") or "SoulX 变声失败")
+            return {"ok": False, "step": "convert", "error": result.get("error"),
+                    "detail": result}
+        self._step(track_id, "convert", "done", engine="soulx",
+                   duration_s=result.get("duration_s"),
+                   peak=result.get("peak"), rms=result.get("rms"))
+        self._set(track_id, progress=75,
+                  artifacts={"vocal_wav": result.get("wav", ""),
+                             "vocal_source": vocals})
+        self._log(f"[{track_id}] soulx convert: {result.get('wav')}")
+        return result
+
     # 开唱前的人声清理链：和训练素材的处理保持一致（去混响 → 去噪）。
     _CLEAN_MODELS = [
         ("dereverb", "dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt", "noreverb"),
         ("denoise", "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt", "dry"),
     ]
 
-    def _clean_vocal(self, track_id: str, out_dir: Path, vocals: str, plan: dict) -> dict:
+    def _clean_vocal(self, track_id: str, out_dir: Path, vocals: str, plan: dict,
+                     resume: bool = True) -> dict:
         """把分离出来的人声做去混响 + 去噪，让它和训练素材同分布。
 
         训练语料走的就是这两步；开唱时若直接用分离结果，混响/残留会让 f0 抖动，
@@ -311,8 +413,16 @@ class Pipeline:
             return {"ok": False, "error": "分离环境未就绪"}
         cur = vocals
         for name, model, stem in self._CLEAN_MODELS:
-            self._step(track_id, "clean", "running", stage=name)
             stage_dir = out_dir / "clean" / name
+            # 续跑：上一轮已经做完的清理阶段直接接着用。输出必须比当前输入新，
+            # 否则可能是更早一次处理留下的旧文件。
+            cached = stage_dir / f"_{stem}.wav"
+            if (resume and self._file_ok(str(cached)) and self._newer(cached, cur)
+                    and self._same_size_class(cached, cur)):
+                cur = str(cached)
+                self._log(f"[{track_id}] resume: 复用 clean/{name} -> {cur}")
+                continue
+            self._step(track_id, "clean", "running", stage=name)
             job = {
                 "input": cur,
                 "out_dir": str(stage_dir),
@@ -446,18 +556,24 @@ class Pipeline:
         self._log(f"[{track_id}] 收到取消请求（delete_files={bool(delete_files)}）")
         return True
 
-    def process_track(self, track_id: str, plan: dict | None = None) -> dict:
+    def process_track(self, track_id: str, plan: dict | None = None,
+                      *, resume: bool = True) -> dict:
         with self._run_lock:
             if track_id in self._busy:
                 return {"ok": False, "error": "该曲目正在处理中"}
             self._busy.add(track_id)
-        return self._process_track_body(track_id, plan)
+        return self._process_track_body(track_id, plan, resume=resume)
 
-    def _process_track_body(self, track_id: str, plan: dict | None = None) -> dict:
+    def _process_track_body(self, track_id: str, plan: dict | None = None,
+                            *, resume: bool = True) -> dict:
         try:
             track = self.store.get(track_id)
             if not track:
                 return {"ok": False, "error": "曲目不存在"}
+            # 上一次已经产出的中间结果。resume=True 时能复用就复用，插件重载后
+            # 点「继续唱」只补没做完的步骤，而不是从分离重新跑一遍。
+            art0 = track.get("artifacts") or {}
+            steps0 = track.get("steps") or {}
             # Probe again for *this* track: free VRAM changes between songs.
             probe = runtime.probe_hardware(force=True)
             plan = runtime.plan_for(
@@ -477,33 +593,55 @@ class Pipeline:
             self._log(f"[{track_id}] start: {track['title']} ({track['source']})")
 
             # 1) separation -------------------------------------------------
-            self._step(track_id, "separate", "running", device=plan.get("sep_device"))
-            sep = self._separate(track, out_dir, plan)
-            if not sep.get("ok"):
-                self._step(track_id, "separate", "failed", error=sep.get("error"))
-                self._set(track_id, status="failed", error=sep.get("error") or "分离失败",
-                          progress=10)
-                return {"ok": False, "step": "separate", "error": sep.get("error"),
-                        "detail": sep}
-            vocals = sep.get("vocals") or ""
-            instrumental = sep.get("instrumental") or ""
-            self._step(track_id, "separate", "done", engine=sep.get("engine"), model=sep.get("model"))
-            if track_id in self._cancelled:
-                raise _TrackCancelled()
-            self._set(track_id, progress=30,
-                      artifacts={"vocals": vocals, "instrumental": instrumental,
-                                 "separate_files": sep.get("files", [])})
+            # 续跑：上一轮已经分离成功的人声/伴奏直接复用。插件重载时最贵的一步
+            # 往往早就做完了，没必要让用户再等一遍。
+            vocals = str(art0.get("vocals") or "")
+            instrumental = str(art0.get("instrumental") or "")
+            sep_step = steps0.get("separate") or {}
+            if (resume and str(sep_step.get("state") or "") == "done"
+                    and self._file_ok(vocals) and self._file_ok(instrumental)):
+                self._step(track_id, "separate", "done", reused=True,
+                           engine=sep_step.get("engine"), model=sep_step.get("model"))
+                self._set(track_id, progress=30,
+                          artifacts={"vocals": vocals, "instrumental": instrumental,
+                                     "separate_files": art0.get("separate_files") or []})
+                self._log(f"[{track_id}] resume: 复用已分离的人声/伴奏")
+            else:
+                self._step(track_id, "separate", "running", device=plan.get("sep_device"))
+                sep = self._separate(track, out_dir, plan)
+                if not sep.get("ok"):
+                    self._step(track_id, "separate", "failed", error=sep.get("error"))
+                    self._set(track_id, status="failed", error=sep.get("error") or "分离失败",
+                              progress=10)
+                    return {"ok": False, "step": "separate", "error": sep.get("error"),
+                            "detail": sep}
+                vocals = sep.get("vocals") or ""
+                instrumental = sep.get("instrumental") or ""
+                self._step(track_id, "separate", "done", engine=sep.get("engine"), model=sep.get("model"))
+                if track_id in self._cancelled:
+                    raise _TrackCancelled()
+                self._set(track_id, progress=30,
+                          artifacts={"vocals": vocals, "instrumental": instrumental,
+                                     "separate_files": sep.get("files", [])})
 
             # 1.5) 人声清理（去混响 → 去噪），和训练素材对齐 ---------------
-            self._step(track_id, "clean", "running")
-            cleaned = self._clean_vocal(track_id, out_dir, vocals, plan)
-            if cleaned.get("ok"):
-                vocal_input = cleaned.get("wav") or vocals
-                self._step(track_id, "clean", "done", wav=vocal_input)
+            clean_step = steps0.get("clean") or {}
+            vocal_clean = str(art0.get("vocal_clean") or "")
+            if (resume and str(clean_step.get("state") or "") == "done"
+                    and self._file_ok(vocal_clean)):
+                vocal_input = vocal_clean
+                self._step(track_id, "clean", "done", wav=vocal_input, reused=True)
+                self._log(f"[{track_id}] resume: 复用已清理的人声")
             else:
-                vocal_input = vocals
-                self._step(track_id, "clean", "skipped", error=cleaned.get("error"))
-                self._log(f"[{track_id}] 清理失败，直接用分离结果：{cleaned.get('error')}")
+                self._step(track_id, "clean", "running")
+                cleaned = self._clean_vocal(track_id, out_dir, vocals, plan, resume=resume)
+                if cleaned.get("ok"):
+                    vocal_input = cleaned.get("wav") or vocals
+                    self._step(track_id, "clean", "done", wav=vocal_input)
+                else:
+                    vocal_input = vocals
+                    self._step(track_id, "clean", "skipped", error=cleaned.get("error"))
+                    self._log(f"[{track_id}] 清理失败，直接用分离结果：{cleaned.get('error')}")
             self._set(track_id, progress=45, artifacts={"vocal_clean": vocal_input})
 
             # 1.55) 混响跟随原曲：用原始分离人声估计原曲人声的混响量 --------
@@ -515,7 +653,12 @@ class Pipeline:
                 auto_strength = 1.0
             auto_strength = max(0.0, min(1.0, auto_strength))
             estimated_wet = None
-            if auto_reverb:
+            reverb_step = steps0.get("reverb") or {}
+            if (resume and auto_reverb and str(reverb_step.get("state") or "") == "done"
+                    and reverb_step.get("wet") is not None):
+                estimated_wet = float(reverb_step["wet"])
+                self._log(f"[{track_id}] resume: 复用混响估计 wet={estimated_wet:.3f}")
+            elif auto_reverb:
                 est = runtime.run_worker(
                     Path(self.paths["synth_python"]), self.workers / "reverb_worker.py",
                     {"input": str(vocals)}, cwd=self.work_dir, timeout=600,
@@ -533,21 +676,94 @@ class Pipeline:
             if track_id in self._cancelled:
                 raise _TrackCancelled()
             # 1.6) 自动配调：把嗓音挪到模型熟悉的音域 ---------------------
-            key_shift = self._auto_key(track_id, vocal_input, plan)
+            key_step = steps0.get("key") or {}
+            if (resume and str(key_step.get("state") or "") == "done"
+                    and key_step.get("shift") is not None):
+                key_shift = int(key_step["shift"])
+                self._log(f"[{track_id}] resume: 复用配调 {key_shift:+d} 半音")
+            else:
+                key_shift = self._auto_key(track_id, vocal_input, plan)
 
-            # 2) voice conversion (DDSP-SVC) ---------------------------------
-            self._step(track_id, "convert", "running", device=plan.get("device"))
-            convert = self._convert(track_id, out_dir, vocal_input, plan, key=key_shift)
-            if not convert.get("ok"):
-                self._step(track_id, "convert", "failed", error=convert.get("error"))
-                self._set(track_id, status="failed", progress=60,
-                          error=convert.get("error") or "变声失败")
-                return {"ok": False, "step": "convert", "error": convert.get("error"),
-                        "detail": convert}
-            converted_vocal = convert.get("wav") or ""
-            self._set(track_id, progress=75,
-                      artifacts={"vocal_wav": converted_vocal,
-                                 "vocal_source": vocals})
+            # 2) voice conversion -------------------------------------------
+            # post_engine=soulx 时走 SoulX-Singer SVC；否则走 DDSP-SVC。
+            # 只有「人声没换、模型/音高/步数都没变」时才能复用上一轮的变声结果。
+            # 用户点「重新唱一遍」会传 resume=False，强制重跑。
+            engine = str(track.get("post_engine") or "ddsp").strip().lower()
+            if engine in ("soulx", "soulx_ddsp"):
+                # SoulX 保持原调，不要让伴奏跟着 auto-key 移调
+                key_shift = 0
+            ckpt_name = Path(str(self.paths.get("ddsp_ckpt") or "")).name
+            infer_step = int(self.paths.get("infer_step") or 80)
+            conv_step = steps0.get("convert") or {}
+            can_reuse_convert = (
+                resume and engine == "ddsp"
+                and str(conv_step.get("engine") or "ddsp") == "ddsp"
+                and str(conv_step.get("state") or "") == "done"
+                and self._file_ok(str(art0.get("vocal_wav") or ""))
+                and str(conv_step.get("input") or "") == str(vocal_input)
+                and str(conv_step.get("model") or "") == ckpt_name
+                and int(conv_step.get("key") or 0) == int(key_shift)
+                and int(conv_step.get("infer_step") or 0) == infer_step
+            )
+            if can_reuse_convert:
+                converted_vocal = str(art0.get("vocal_wav"))
+                self._step(track_id, "convert", "done", engine="ddsp",
+                           model=ckpt_name, key=key_shift, infer_step=infer_step,
+                           input=str(vocal_input), reused=True)
+                self._set(track_id, progress=75,
+                          artifacts={"vocal_wav": converted_vocal,
+                                     "vocal_source": vocals})
+                self._log(f"[{track_id}] resume: 复用已变声人声 {converted_vocal}")
+            elif engine in ("soulx", "soulx_ddsp"):
+                convert = self._soulx_convert(track_id, out_dir, vocal_input, plan)
+                if not convert.get("ok"):
+                    self._set(track_id, status="failed", progress=60,
+                              error=convert.get("error") or "SoulX 变声失败")
+                    return {"ok": False, "step": "convert",
+                            "error": convert.get("error"), "detail": convert}
+                converted_vocal = convert.get("wav") or ""
+                if engine == "soulx_ddsp":
+                    # 二级 DDSP：SoulX 负责唱法/咬字（保持原调），DDSP 再用
+                    # 44.1 kHz 的模型补回气音和音色。中间干声已在 SoulX worker
+                    # 里对齐到原干声 RMS，所以 DDSP 的输入电平是正常的。
+                    ddsp_dir = out_dir / "ddsp"
+                    ddsp_dir.mkdir(parents=True, exist_ok=True)
+                    self._log(f"[{track_id}] SoulX→DDSP: "
+                              f"{Path(converted_vocal).name} → DDSP")
+                    polish = self._convert(track_id, ddsp_dir, converted_vocal,
+                                           plan, key=0)
+                    if not polish.get("ok"):
+                        self._set(track_id, status="failed", progress=70,
+                                  error=polish.get("error")
+                                  or "SoulX→DDSP 二次变声失败")
+                        return {"ok": False, "step": "convert",
+                                "error": polish.get("error"), "detail": polish}
+                    converted_vocal = polish.get("wav") or ""
+                    # _convert 内部会把这一步标成 ddsp；这里改写成本次真实
+                    # 的引擎，面板和曲目记录才能区分。
+                    self._step(track_id, "convert", "done",
+                               engine="soulx_ddsp",
+                               duration_s=polish.get("duration_s"),
+                               peak=polish.get("peak"),
+                               rms=polish.get("rms"))
+                    self._set(track_id, progress=75,
+                              artifacts={"vocal_wav": converted_vocal,
+                                         "vocal_source": vocal_input})
+                    self._log(f"[{track_id}] soulx→ddsp convert: "
+                              f"{converted_vocal}")
+            else:
+                self._step(track_id, "convert", "running", device=plan.get("device"))
+                convert = self._convert(track_id, out_dir, vocal_input, plan, key=key_shift)
+                if not convert.get("ok"):
+                    self._step(track_id, "convert", "failed", error=convert.get("error"))
+                    self._set(track_id, status="failed", progress=60,
+                              error=convert.get("error") or "变声失败")
+                    return {"ok": False, "step": "convert", "error": convert.get("error"),
+                            "detail": convert}
+                converted_vocal = convert.get("wav") or ""
+                self._set(track_id, progress=75,
+                          artifacts={"vocal_wav": converted_vocal,
+                                     "vocal_source": vocals})
 
             if track_id in self._cancelled:
                 raise _TrackCancelled()

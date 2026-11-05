@@ -7,7 +7,7 @@
 // 再单独问一次 ms_hw_profile。
 import { Alert, StatusBadge, useEffect, useRef, useState } from "@neko/plugin-ui"
 import { callEntry, short } from "./api"
-import { BRAND_DEEP, INK, INK_2, LINE, Btn, Col, Empty, Field, FoldCard, Grid, Input, KV, Muted, Panel, PRIMARY_BTN, Pill, Row, Section, Select, Toggle } from "./ui"
+import { BRAND_DEEP, INK, INK_2, LINE, Bar, Btn, Col, Empty, Field, FoldCard, Grid, Input, KV, Muted, Panel, PRIMARY_BTN, Pill, Row, Section, Select, Toggle } from "./ui"
 
 /** 把档位翻成一句人话（不出现 low/mid/high 这种词）。 */
 function tierWord(plan: any): { text: string; tone: any } {
@@ -53,6 +53,10 @@ export function PageSettings(props: { api: any; snap: any; onRefresh: () => void
   const [notice, setNotice] = useState<any>(null)
   const [env, setEnv] = useState<any>(() => ({ items: envRowsFrom(s.env) }))
   const [openAdv, setOpenAdv] = useState(false)
+  const [soulx, setSoulx] = useState<any>(null)
+  const [soulxJobId, setSoulxJobId] = useState("")
+  const [soulxJob, setSoulxJob] = useState<any>(null)
+  const [soulxBusy, setSoulxBusy] = useState("")
   const [keyShift, setKeyShift] = useState("0")
   const [registerShift, setRegisterShift] = useState("0")
   const [inferStep, setInferStep] = useState("50")
@@ -288,8 +292,72 @@ export function PageSettings(props: { api: any; snap: any; onRefresh: () => void
     onRefresh()
   })
 
+  const loadSoulx = async () => {
+    try {
+      const r: any = await callEntry(api, "ms_soulx_status", {}, 30000)
+      setSoulx(r)
+    } catch (e: any) { /* 下一拍再试 */ }
+  }
+  useEffect(() => { loadSoulx() }, [])
+  // 从 ms_state 的 jobs 里接上正在跑的 SoulX 安装（面板重开/别处启动也能看到进度）
+  useEffect(() => {
+    if (soulxJobId) return
+    const jobs: any = (snap && snap.jobs) || {}
+    const hit = Object.keys(jobs).find((id: string) => {
+      const j = jobs[id] || {}
+      return j.job === "soulx-install" && (j.state === "running" || j.state === "queued")
+    })
+    if (hit) {
+      setSoulxJobId(hit)
+      setSoulxJob(jobs[hit] || null)
+    }
+  }, [snap])
+  useEffect(() => {
+    if (!soulxJobId) return
+    let alive = true
+    const tick = async () => {
+      try {
+        const r: any = await callEntry(api, "ms_ace_job", { job_id: soulxJobId }, 30000)
+        if (!alive) return
+        const j = (r && r.job) || null
+        setSoulxJob(j)
+        if (j && (j.state === "done" || j.state === "failed")) {
+          setSoulxJobId("")
+          setSoulxBusy("")
+          loadSoulx()
+          onRefresh()
+        }
+      } catch (e) { /* 下一拍再试 */ }
+    }
+    tick()
+    const id = setInterval(tick, 3000)
+    return () => { alive = false; clearInterval(id) }
+  }, [soulxJobId])
+  const startSoulx = async () => {
+    setSoulxBusy("install")
+    setNotice(null)
+    try {
+      const r: any = await callEntry(api, "ms_soulx_install", {}, 60000)
+      if (r && r.ok && r.job_id) {
+        setSoulxJobId(String(r.job_id))
+        setNotice({ tone: "info", text: "开始下载/安装 SoulX，进度在下面。" })
+      } else if (r && r.ok && r.ready) {
+        setSoulxBusy("")
+        setNotice({ tone: "info", text: "SoulX 已经装好了。" })
+        loadSoulx()
+      } else {
+        setSoulxBusy("")
+        setNotice({ tone: "error", text: "没能开始：" + ((r && r.error) || "未知错误") })
+      }
+    } catch (e: any) {
+      setSoulxBusy("")
+      setNotice({ tone: "error", text: String((e && e.message) || e) })
+    }
+  }
+
   const envItems = (env && Array.isArray(env.items)) ? env.items : []
   const envMissing = envItems.filter((it: any) => !it.ok)
+  const soulxReady = Boolean(soulx && soulx.ready)
 
   return (
     <Col style={{ gap: 24 }}>
@@ -359,6 +427,41 @@ export function PageSettings(props: { api: any; snap: any; onRefresh: () => void
           </div>
         ) : null}
       </Section>
+
+      {/* SoulX-Singer */}
+      <Panel title="SoulX-Singer（原创歌曲后处理）"
+             extra={<Pill tone={soulxReady ? "success" : "warning"}>{soulxReady ? "已安装" : "未安装"}</Pill>}>
+        <Col style={{ gap: 12 }}>
+          {soulxReady ? (
+            <Muted>已就绪：在「原创歌曲」页把「唱完后再处理干声」选 SoulX-Singer SVC 就能用。</Muted>
+          ) : (
+            <Muted>
+              需要下载 SVC 权重 + RMVPE（约 5.8GB）和运行环境（torch 约 2.9GB）。
+              支持断点续传；下载会在这个页面显示进度。
+            </Muted>
+          )}
+          {!soulxReady && soulx && Array.isArray(soulx.problems) && soulx.problems.length ? (
+            <Muted>缺少：{soulx.problems.join("、")}</Muted>
+          ) : null}
+          {soulxJobId || soulxJob ? (
+            <Col style={{ gap: 6 }}>
+              <Bar pct={Number((soulxJob && soulxJob.progress) || 0)} />
+              <Row style={{ justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
+                <Muted>{soulxJob ? (soulxJob.detail || "正在准备…") : "正在启动…"}</Muted>
+                <Muted>{Number((soulxJob && soulxJob.progress) || 0)}%</Muted>
+              </Row>
+            </Col>
+          ) : null}
+          <Row style={{ flexWrap: "wrap", gap: 8 }}>
+            {!soulxReady ? (
+              <Btn style={PRIMARY_BTN} disabled={!!soulxBusy || !!soulxJobId} onClick={startSoulx}>
+                {soulxJobId ? "正在下载/安装…" : soulxJob && soulxJob.state === "failed" ? "继续下载/安装" : "下载并安装 SoulX"}
+              </Btn>
+            ) : null}
+            <Btn onClick={loadSoulx}>重新检查</Btn>
+          </Row>
+        </Col>
+      </Panel>
 
       {/* 装在哪儿 */}
       <Panel title="文件放在哪里" extra={<Muted>一般不用改</Muted>}>

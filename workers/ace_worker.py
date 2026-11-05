@@ -67,6 +67,13 @@ def main() -> int:
             guidance_scale=float(job.get("guidance_scale") or 7.0),
             seed=maybe_int(job.get("seed")) if maybe_int(job.get("seed")) is not None else -1,
             use_random_seed=bool(job.get("use_random_seed", True)),
+            batch_size=max(1, min(8, int(job.get("batch_size") or 1))),
+            seeds=job.get("seeds") or None,
+            dcw_enabled=bool(job.get("dcw_enabled", True)),
+            dcw_mode=str(job.get("dcw_mode") or "double"),
+            dcw_scaler=float(job.get("dcw_scaler") or 0.05),
+            dcw_high_scaler=float(job.get("dcw_high_scaler") or 0.02),
+            dcw_wavelet=str(job.get("dcw_wavelet") or "haar"),
             audio_format="wav",
         )
         runtime_config = ace_runtime.AceStepRuntimeConfig(
@@ -85,10 +92,57 @@ def main() -> int:
                                or "ACE-Step 生成失败")
         if not generated.audio_paths:
             raise RuntimeError("ACE-Step 没有返回音频")
+        audios = [str(p) for p in generated.audio_paths]
+        # 多候选时按频谱平衡打分，默认把最不闷、最不轰头的那条排第一。
+        # 分数只是「自动挑一个」，其余候选仍会回到面板里给用户试听。
+        best, scores = 0, []
+        try:
+            import numpy as np
+            import soundfile as sf
+            import librosa
+
+            vals = []
+            for audio_path in audios:
+                y, sr = sf.read(audio_path, dtype="float32", always_2d=True)
+                mono = y.mean(axis=1)
+                if len(mono) < sr * 2:
+                    vals.append(0.0)
+                    continue
+                spec = np.abs(librosa.stft(mono, n_fft=4096, hop_length=1024)) ** 2
+                freqs = librosa.fft_frequencies(sr=sr, n_fft=4096)
+                power = spec.mean(axis=1)
+                total = float(power.sum()) + 1e-12
+
+                def band(lo, hi):
+                    mask = (freqs >= lo) & (freqs < hi)
+                    return float(power[mask].sum()) / total
+
+                r01, r14 = band(0, 1000), band(1000, 4000)
+                r48, r812 = band(4000, 8000), band(8000, 12000)
+                rms = float(np.sqrt((mono ** 2).mean()) + 1e-12)
+                crest = 20 * np.log10(float(np.abs(mono).max()) / rms + 1e-12)
+                corr = 1.0
+                if y.shape[1] > 1:
+                    corr = float(np.corrcoef(y[:, 0], y[:, 1])[0, 1])
+                score = 0.0
+                score += 2.0 * min(1.0, r14 / 0.18)       # 中高频存在感
+                score += 1.0 * min(1.0, r48 / 0.03)      # 亮度
+                score += 1.0 * min(1.0, r812 / 0.012)    # 空气感
+                score -= 2.0 * max(0.0, r01 - 0.75)      # 低频轰头
+                score -= 0.5 * abs(crest - 13.0) / 10.0  # 动态太极端
+                score -= 2.0 * max(0.0, corr - 0.99)     # 几乎是单声道
+                vals.append(round(float(score), 4))
+            if vals:
+                best = int(np.argmax(vals))
+                scores = vals
+        except Exception:  # noqa: BLE001 - 打分失败就退回第一条
+            pass
         result.update({
             "ok": True,
-            "wav": str(generated.audio_paths[0]),
-            "audios": [str(p) for p in generated.audio_paths],
+            "wav": audios[best],
+            "audios": audios,
+            "best": best,
+            "scores": scores,
             "prompt": generated.prompt,
             "lyrics": generated.lyrics,
             "duration": (generated.metas or {}).get("duration"),

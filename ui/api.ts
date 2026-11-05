@@ -20,18 +20,25 @@ export function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms))
 }
 
+/** 业务失败（插件明确返回 ok=false）不应该再走备用通道重试。 */
+function businessError(message: string): Error {
+  const err: any = Error(message)
+  err.final = true
+  return err
+}
+
 /** 一层层剥开宿主/插件的外壳：{success,data}、{value}、{result}，ok=false 视为失败。 */
 export function unpack(response: any): any {
   let data = response
   for (let i = 0; i < 8; i++) {
     if (!data || typeof data !== "object") break
-    if (data.success === false) throw Error(String(data.error || "插件返回失败"))
+    if (data.success === false) throw businessError(String(data.error || "插件返回失败"))
     if (data.value !== undefined && data.data === undefined) { data = data.value; continue }
     if (data.data !== undefined && data.ok === undefined) { data = data.data; continue }
     if (data.result !== undefined && data.ok === undefined) { data = data.result; continue }
     break
   }
-  if (data && data.ok === false) throw Error(String(data.error || data.message || "操作失败"))
+  if (data && data.ok === false) throw businessError(String(data.error || data.message || "操作失败"))
   return data || {}
 }
 
@@ -87,9 +94,22 @@ export async function callEntry(api: Api, entryId: string, args: any = {},
   try {
     return await viaRuns(entryId, args, timeoutMs)
   } catch (first: any) {
+    // 插件已经明确说“不行”（例如音色与模型不匹配），换通道重试没有意义，
+    // 还会把真正的错误原因盖成“备用通道超时”。
+    if (first && first.final) throw first
     if (!api || typeof api.call !== "function") throw first
     try {
-      return unpack(await api.call(entryId, args, { userInitiated: true }))
+      const fallback: any = api.call(entryId, args, { userInitiated: true })
+      // 宿主 hosted-ui 的备用通道没有超时；插件重载时它可能永远不返回，
+      // 面板就会一直卡在「正在生成」。这里强制给它一个上限。
+      try { fallback.catch(() => {}) } catch (e) { /* 非 Promise */ }
+      const cap = Math.min(Math.max(timeoutMs, 5000), 20000)
+      const guarded: any = await Promise.race([
+        fallback,
+        new Promise((_, reject) => setTimeout(
+          () => reject(Error("备用通道超时（" + Math.round(cap / 1000) + " 秒）")), cap)),
+      ])
+      return unpack(guarded)
     } catch (second: any) {
       throw Error(String((first && first.message) || first) + "；备用通道：" +
         String((second && second.message) || second))

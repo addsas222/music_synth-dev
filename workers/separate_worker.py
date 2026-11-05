@@ -21,8 +21,11 @@ def _chunk_split(input_path: str, out_dir: Path, seg_s: float, overlap_s: float)
     """
     import soundfile as sf
     data, sr = sf.read(input_path, dtype="float32", always_2d=True)
-    mono = data if data.ndim == 1 else data.mean(axis=1)
-    total = len(mono) / sr
+    if data.ndim == 1:
+        data = data[:, None]
+    # 保留原始声道，不再下混成单声道：ACE 生成的伴奏本身是立体声，
+    # 下混会让成品的背景音乐明显变窄、变糊。
+    total = len(data) / sr
     segs = []
     step = seg_s - overlap_s
     cursor = 0.0
@@ -38,7 +41,7 @@ def _chunk_split(input_path: str, out_dir: Path, seg_s: float, overlap_s: float)
         cursor += step
     paths = []
     for idx, (s, e) in enumerate(segs):
-        chunk = mono[int(s * sr):int(e * sr)]
+        chunk = data[int(s * sr):int(e * sr)]
         p = out_dir / f"_chunk_{idx:03d}.wav"
         sf.write(str(p), chunk, sr, subtype="FLOAT")
         paths.append(p)
@@ -76,6 +79,17 @@ def _resample(mono, rate: int, sr: int):
         return np.interp(target, source, mono.astype(np.float64)).astype(np.float32)
 
 
+def _resample_audio(data, rate: int, sr: int):
+    """Resample mono [T] or multichannel [T, C] float data along time."""
+    import numpy as np
+
+    arr = np.asarray(data, dtype=np.float32)
+    if arr.ndim == 1:
+        return _resample(arr, rate, sr)
+    return np.stack([_resample(arr[:, c], rate, sr)
+                     for c in range(arr.shape[1])], axis=1)
+
+
 def _ensure_rate(path: Path, sr: int) -> Path:
     """Rewrite ``path`` in place at ``sr`` when the file was written at another rate."""
     import numpy as np
@@ -88,8 +102,9 @@ def _ensure_rate(path: Path, sr: int) -> Path:
     if int(info.samplerate) == int(sr):
         return path
     data, rate = sf.read(str(path), dtype="float32", always_2d=True)
-    mono = data.mean(axis=1) if data.ndim > 1 else data
-    converted = _resample(mono, rate, sr)
+    if data.ndim == 1:
+        data = data[:, None]
+    converted = _resample_audio(data, rate, sr)
     tmp = path.with_name(path.name + ".rate-fix.wav")
     sf.write(str(tmp), np.asarray(converted, dtype=np.float32), int(sr), subtype="FLOAT")
     tmp.replace(path)
@@ -118,15 +133,21 @@ def _merge_chunks(chunk_paths: list[Path], stems: dict[str, list[Path]],
         pieces = []
         for p in paths:
             data, rate = sf.read(str(p), dtype="float32", always_2d=True)
-            m = data.mean(axis=1) if data.ndim > 1 else data
-            pieces.append(_resample(m, rate, sr).astype(np.float64))
+            if data.ndim == 1:
+                data = data[:, None]
+            pieces.append(_resample_audio(data, rate, sr).astype(np.float64))
         if not pieces:
             merged[stem_name] = ""
             continue
+        channels = max(int(m.shape[1]) for m in pieces)
+        # 单声道片段补成多声道，避免拼接时维度不一致
+        for i, m in enumerate(pieces):
+            if m.shape[1] == 1 and channels > 1:
+                pieces[i] = np.repeat(m, channels, axis=1)
         total = max(i * hop + len(m) for i, m in enumerate(pieces))
         # 重叠区用权重淡化
-        acc = np.zeros(total, dtype=np.float64)
-        weight = np.zeros(total, dtype=np.float64)
+        acc = np.zeros((total, channels), dtype=np.float64)
+        weight = np.zeros((total, 1), dtype=np.float64)
         for i, m in enumerate(pieces):
             off = i * hop
             n = min(len(m), total - off)
@@ -139,9 +160,10 @@ def _merge_chunks(chunk_paths: list[Path], stems: dict[str, list[Path]],
                     w[:fade] = np.linspace(0.0, 1.0, fade)
                 if i < len(pieces) - 1 and fade < n:
                     w[-fade:] = np.linspace(1.0, 0.0, fade)
-            acc[off:off + n] += m[:n] * w
-            weight[off:off + n] += w
-        merged_stem = np.where(weight > 1e-6, acc / np.maximum(weight, 1e-6), 0.0)
+            acc[off:off + n] += m[:n] * w[:, None]
+            weight[off:off + n] += w[:, None]
+        merged_stem = np.where(weight > 1e-6,
+                               acc / np.maximum(weight, 1e-6), 0.0)
         out = out_dir / f"_{stem_name}.wav"
         sf.write(str(out), merged_stem.astype(np.float32), sr, subtype="FLOAT")
         merged[stem_name] = str(out)

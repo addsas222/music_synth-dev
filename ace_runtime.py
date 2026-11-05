@@ -70,6 +70,13 @@ class AceStepGenerateRequest:
     audio_cover_strength: float = 1.0
     cover_noise_strength: float = 0.0
 
+    # ACE-Step v0.1.7+ DCW 采样校正（默认开；关掉可用于排查显存/兼容问题）
+    dcw_enabled: bool = True
+    dcw_mode: str = "double"
+    dcw_scaler: float = 0.05
+    dcw_high_scaler: float = 0.02
+    dcw_wavelet: str = "haar"
+
     audio_format: str = "wav"
 
 
@@ -202,6 +209,11 @@ class AceStepLocalRuntime:
             repainting_end=-1 if request.repainting_end is None else request.repainting_end,
             audio_cover_strength=request.audio_cover_strength,
             cover_noise_strength=request.cover_noise_strength,
+            dcw_enabled=bool(request.dcw_enabled),
+            dcw_mode=str(request.dcw_mode or "double"),
+            dcw_scaler=float(request.dcw_scaler),
+            dcw_high_scaler=float(request.dcw_high_scaler),
+            dcw_wavelet=str(request.dcw_wavelet or "haar"),
             thinking=False,
             use_cot_metas=False,
             use_cot_caption=False,
