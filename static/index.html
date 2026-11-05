@@ -1078,6 +1078,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
   function emit() {
     SUBS.forEach((f) => f());
   }
+  var CORPUS_POLL = null;
   function useCorpus(api) {
     const [, force] = useState(0);
     useEffect(() => {
@@ -1088,6 +1089,16 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       };
     }, []);
     if (!STATE) STATE = createState(api);
+    if (!CORPUS_POLL && typeof window !== "undefined") {
+      CORPUS_POLL = setInterval(() => {
+        const s = STATE;
+        if (!s || s.busy || s._refreshing) return;
+        s._refreshing = true;
+        s.refresh().finally(() => {
+          s._refreshing = false;
+        });
+      }, 4e3);
+    }
     return STATE;
   }
   function createState(api) {
@@ -1633,6 +1644,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     return inner ? num(inner.dur_s) : 0;
   }
   function metaOf(f) {
+    if (f && f.status === "queued") return "排队中…";
     if (f && f.status === "processing") return "处理中…";
     if (f && f.status === "error") return "上次处理中断，可重新添加";
     const bits = [];
@@ -1658,6 +1670,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     };
     const isDone = (src) => Boolean(src) && (src.status === "done" || !src.status && (src.clips || []).length > 0);
     const isProcessing = (src) => Boolean(src) && src.status === "processing";
+    const isQueued = (src) => Boolean(src) && src.status === "queued";
     const act = async (sourceId, action) => {
       if (!sourceId || busy) return;
       if (action === "delete") setRemoved((prev) => prev.concat([sourceId]));
@@ -1733,6 +1746,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
             const isHidden = Boolean(f && f.hidden);
             const done2 = isDone(f) && !isHidden;
             const proc = isProcessing(f) && !isHidden;
+            const queued = isQueued(f) && !isHidden;
             const job = jobOf(f);
             const livePct = f && typeof f.progress === "number" ? f.progress : job && job.pct || 0;
             const pct = proc ? Math.max(0, Math.min(100, Number(livePct) || 0)) : 0;
@@ -1748,7 +1762,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
                 /* @__PURE__ */ jsxs(Row, { style: { gap: 8, alignItems: "center", minWidth: 0 }, children: [
                   /* @__PURE__ */ jsx("span", { style: { width: 22, height: 22, borderRadius: 7, background: done2 ? "rgba(31,157,99,0.14)" : "rgba(224,45,118,0.10)", color: tone, display: "grid", placeItems: "center", fontSize: 11, flex: "0 0 auto" }, children: done2 ? "✓" : isHidden ? "○" : props.slot === "song" ? "♪" : props.slot === "dry_sing" ? "◍" : "⌨" }),
                   /* @__PURE__ */ jsx("div", { title: nameOf(f, i), style: { minWidth: 0, flex: 1, fontSize: 12.5, color: INK, lineHeight: "18px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, children: nameOf(f, i) }),
-                  done2 ? /* @__PURE__ */ jsx("span", { style: { fontSize: 11, color: "#1c8a58", background: "rgba(31,157,99,0.14)", borderRadius: 999, padding: "1px 9px", fontWeight: 600, flex: "0 0 auto" }, children: "完成" }) : proc ? /* @__PURE__ */ jsx("span", { style: { fontSize: 11, color: "#b06a00", background: "#fff4e2", borderRadius: 999, padding: "1px 9px", flex: "0 0 auto" }, children: "处理中" }) : null
+                  done2 ? /* @__PURE__ */ jsx("span", { style: { fontSize: 11, color: "#1c8a58", background: "rgba(31,157,99,0.14)", borderRadius: 999, padding: "1px 9px", fontWeight: 600, flex: "0 0 auto" }, children: "完成" }) : proc ? /* @__PURE__ */ jsx("span", { style: { fontSize: 11, color: "#b06a00", background: "#fff4e2", borderRadius: 999, padding: "1px 9px", flex: "0 0 auto" }, children: "处理中" }) : queued ? /* @__PURE__ */ jsx("span", { style: { fontSize: 11, color: "#6b6b76", background: "rgba(40,37,50,0.06)", borderRadius: 999, padding: "1px 9px", flex: "0 0 auto" }, children: "排队中" }) : null
                 ] }),
                 proc ? /* @__PURE__ */ jsxs(Row, { style: { gap: 8, alignItems: "center", marginTop: 6 }, children: [
                   /* @__PURE__ */ jsx(Bar, { pct }),
@@ -1874,7 +1888,8 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
         ] }),
         /* @__PURE__ */ jsxs(Col, { style: { gap: 8, flex: "0 0 auto" }, children: [
           /* @__PURE__ */ jsx(Btn, { style: PRIMARY_BTN, onClick: () => onGo("train"), children: "去训练声音 →" }),
-          /* @__PURE__ */ jsx(Muted, { children: "说话录音默认不计入，可在训练页打开。" })
+          /* @__PURE__ */ jsx(Toggle, { on: c.countSpeech, onChange: c.setCountSpeech, label: "把说话录音也算进可用时长" }),
+          /* @__PURE__ */ jsx(Muted, { children: "默认只算唱歌/清唱；打开后下面的进度和时长会把说话录音一起算。" })
         ] })
       ] }) }),
       /* @__PURE__ */ jsx(Panel, { children: /* @__PURE__ */ jsxs(Col, { style: { gap: 10 }, children: [
@@ -1940,9 +1955,10 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
         const srcs = v.raw_files.filter((f) => !(f && f.hidden));
         const doneN = srcs.filter((f) => f.status === "done" || !f.status && (f.clips || []).length > 0).length;
         const activeSrc = srcs.find((f) => f.status === "processing");
+        const queuedN = srcs.filter((f) => f.status === "queued").length;
         const totalN = srcs.length;
         const pctN = totalN ? Math.min(100, Math.round((doneN + (activeSrc ? (Number(activeSrc.progress) || 0) / 100 : 0)) / totalN * 100)) : 0;
-        const busyN = Boolean(activeSrc);
+        const busyN = Boolean(activeSrc) || queuedN > 0;
         return /* @__PURE__ */ jsxs(Panel, { style: { display: "flex", flexDirection: "column", gap: 12 }, children: [
           /* @__PURE__ */ jsxs(Row, { style: { justifyContent: "space-between", gap: 8 }, children: [
             /* @__PURE__ */ jsx("div", { style: { fontSize: 15, fontWeight: 700, color: INK }, children: m.title }),
@@ -1982,7 +1998,10 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
             num(list.orphans[m.slot]),
             " 个未入库文件"
           ] }) }) : null,
-          busyN && totalN > 0 ? /* @__PURE__ */ jsx(Row, { style: { justifyContent: "flex-end" }, children: /* @__PURE__ */ jsx(StatusBadge, { tone: "warning", children: "处理中 " + pctN + "% · " + doneN + "/" + totalN }) }) : null
+          busyN && totalN > 0 ? /* @__PURE__ */ jsx(Row, { style: { justifyContent: "flex-end" }, children: /* @__PURE__ */ jsxs(StatusBadge, { tone: "warning", children: [
+            (activeSrc ? "处理中" : "排队中") + " " + pctN + "% · " + doneN + "/" + totalN,
+            queuedN ? " · 队列 " + queuedN : ""
+          ] }) }) : null
         ] }, m.slot);
       }) }),
       /* @__PURE__ */ jsxs(Section, { title: "收到的片段", extra: /* @__PURE__ */ jsxs(Muted, { children: [

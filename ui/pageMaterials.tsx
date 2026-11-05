@@ -6,7 +6,7 @@
 import { Alert, StatusBadge, useEffect, useState } from "@neko/plugin-ui"
 import { audioSrcOf, callEntry, dataUriOf, uploadModelChunked } from "./api"
 import { MATERIALS, useCorpus } from "./materials"
-import { BRAND_DEEP, INK, INK_2, LINE, Btn, Col, DropZone, Empty, FoldCard, Grid, Muted, Panel, Pill, PRIMARY_BTN, Ring, Row, Section, Soft, fmtTime } from "./ui"
+import { BRAND_DEEP, INK, INK_2, LINE, Btn, Col, DropZone, Empty, FoldCard, Grid, Muted, Panel, Pill, PRIMARY_BTN, Ring, Row, Section, Soft, Toggle, fmtTime } from "./ui"
 import { SourceFileList } from "./sourceList"
 import { STEPS_CHOICES, clipList, deficitText, effectiveSeconds, materialTitle, num, requirementOf, slotView } from "./trainModel"
 
@@ -114,7 +114,8 @@ export function PageMaterials(props: { api: any; onGo: (page: string) => void })
           </div>
           <Col style={{ gap: 8, flex: "0 0 auto" }}>
             <Btn style={PRIMARY_BTN} onClick={() => onGo("train")}>去训练声音 →</Btn>
-            <Muted>说话录音默认不计入，可在训练页打开。</Muted>
+            <Toggle on={c.countSpeech} onChange={c.setCountSpeech} label="把说话录音也算进可用时长" />
+            <Muted>默认只算唱歌/清唱；打开后下面的进度和时长会把说话录音一起算。</Muted>
           </Col>
         </div>
       </Panel>
@@ -171,11 +172,12 @@ export function PageMaterials(props: { api: any; onGo: (page: string) => void })
           const srcs = v.raw_files.filter((f: any) => !(f && f.hidden))
           const doneN = srcs.filter((f: any) => f.status === "done" || (!f.status && (f.clips || []).length > 0)).length
           const activeSrc = srcs.find((f: any) => f.status === "processing")
+          const queuedN = srcs.filter((f: any) => f.status === "queued").length
           const totalN = srcs.length
           const pctN = totalN
             ? Math.min(100, Math.round(((doneN + (activeSrc ? (Number(activeSrc.progress) || 0) / 100 : 0)) / totalN) * 100))
             : 0
-          const busyN = Boolean(activeSrc)
+          const busyN = Boolean(activeSrc) || queuedN > 0
           return (
             <Panel key={m.slot} style={{ display: "flex", flexDirection: "column", gap: 12 }}>
               <Row style={{ justifyContent: "space-between", gap: 8 }}>
@@ -208,7 +210,8 @@ export function PageMaterials(props: { api: any; onGo: (page: string) => void })
               {busyN && totalN > 0 ? (
                 <Row style={{ justifyContent: "flex-end" }}>
                   <StatusBadge tone="warning">
-                    {"处理中 " + pctN + "% · " + doneN + "/" + totalN}
+                    {(activeSrc ? "处理中" : "排队中") + " " + pctN + "% · " + doneN + "/" + totalN}
+                    {queuedN ? " · 队列 " + queuedN : ""}
                   </StatusBadge>
                 </Row>
               ) : null}

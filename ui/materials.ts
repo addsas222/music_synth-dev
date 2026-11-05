@@ -85,6 +85,8 @@ export function materialSubs() { return SUBS }
 function emit() { SUBS.forEach((f) => f()) }
 
 /** 模块级单例：第一次用到时创建，之后所有页面共用。 */
+let CORPUS_POLL: any = null
+
 export function useCorpus(api: any): CorpusState {
   const [, force] = useState(0)
   useEffect(() => {
@@ -93,6 +95,15 @@ export function useCorpus(api: any): CorpusState {
     return () => { SUBS.delete(f) }
   }, [])
   if (!STATE) STATE = createState(api)
+  // 素材在后台是单线程队列慢慢处理的；页面不刷新的话，进度会一直停在刚打开时那一眼。
+  if (!CORPUS_POLL && typeof window !== "undefined") {
+    CORPUS_POLL = setInterval(() => {
+      const s = STATE
+      if (!s || s.busy || (s as any)._refreshing) return
+      ;(s as any)._refreshing = true
+      s.refresh().finally(() => { (s as any)._refreshing = false })
+    }, 4000)
+  }
   return STATE
 }
 

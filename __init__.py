@@ -2707,13 +2707,13 @@ class MusicSynthPlugin(NekoPluginBase):
                 pass
 
     def _corpus_resume_pending(self) -> None:
-        """插件重启后，把上次没跑完（status=processing）的素材重新排队。"""
+        """插件重启后，把上次没跑完（status=queued/processing）的素材重新排队。"""
         try:
             index = self._corpus_index()
         except Exception:  # noqa: BLE001
             return
         for src in list(index.get("sources", [])):
-            if str(src.get("status") or "") != "processing":
+            if str(src.get("status") or "") not in ("queued", "processing"):
                 continue
             files = [f for f in src.get("files", [])
                      if isinstance(f, dict) and Path(str(f.get("path") or "")).is_file()]
@@ -2729,7 +2729,7 @@ class MusicSynthPlugin(NekoPluginBase):
                     f["dur_s"] = self._probe_duration(Path(str(f["path"])))
             job_id = self._job_begin(f"corpus_{slot}")
             try:
-                self._corpus_update_source(str(src.get("id")), job_id=job_id)
+                self._corpus_update_source(str(src.get("id")), job_id=job_id, status="queued")
             except Exception:  # noqa: BLE001
                 pass
             self._corpus_enqueue(job_id, slot, str(src.get("id")), files)
@@ -2754,7 +2754,7 @@ class MusicSynthPlugin(NekoPluginBase):
             if slot not in slots:
                 slot = "song"
             entry = src
-            if str(src.get("status") or "") == "processing" and src.get("job_id"):
+            if str(src.get("status") or "") in ("queued", "processing") and src.get("job_id"):
                 job = jobs_snap.get(str(src.get("job_id")))
                 if job:
                     entry = dict(src)
@@ -2968,6 +2968,8 @@ class MusicSynthPlugin(NekoPluginBase):
             paths = [f["path"] for f in files if f.get("path")]
             if not paths:
                 raise RuntimeError("没有可处理的素材文件")
+            self._corpus_update_source(source_id, status="processing", error="")
+            self._job_update(job_id, phase="processing", pct=1, stage_text="开始处理")
             corpus_py = self._train_worker("corpus_worker.py")
             sep_worker = self._train_worker("separate_worker.py")
             sep_py = Path(str(self._pipeline.paths.get("sep_python") or ""))
@@ -3122,7 +3124,7 @@ class MusicSynthPlugin(NekoPluginBase):
             raw_paths.append(str(target))
         if not raw_paths:
             return Ok({"ok": False, "error": "需要 path 或 data_b64"})
-        return self._corpus_add_sources(slot, raw_paths)
+        return await asyncio.to_thread(self._corpus_add_sources, slot, raw_paths)
 
     # ---- 语料上传 / 排队 --------------------------------------------------
     def _corpus_add_sources(self, slot: str, raw_paths: list):
@@ -3181,7 +3183,7 @@ class MusicSynthPlugin(NekoPluginBase):
             index.setdefault("sources", []).append({
                 "id": source_id, "slot": slot, "files": files, "clips": [], "valid_s": 0.0,
                 "added_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "status": "processing", "error": "", "job_id": job_id,
+                "status": "queued", "error": "", "job_id": job_id,
             })
             self._corpus_write_index(index)
         ahead = self._corpus_enqueue(job_id, slot, source_id, files)
@@ -3242,7 +3244,7 @@ class MusicSynthPlugin(NekoPluginBase):
                 index.setdefault("sources", []).append({
                     "id": source_id, "slot": slot, "files": files, "clips": [], "valid_s": 0.0,
                     "added_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "status": "processing", "error": "", "recovered": True, "job_id": job_id,
+                    "status": "queued", "error": "", "recovered": True, "job_id": job_id,
                 })
                 self._corpus_write_index(index)
             self._orphans_cache = None
@@ -3355,7 +3357,7 @@ class MusicSynthPlugin(NekoPluginBase):
                 path.rename(dest)
             except OSError:
                 dest = path
-        return self._corpus_add_sources(rec["slot"], [str(dest)])
+        return await asyncio.to_thread(self._corpus_add_sources, rec["slot"], [str(dest)])
 
     @plugin_entry(id="ms_corpus_recover", name="为她而唱 · 恢复未入库素材",
                   description="把语料库目录里还没登记过的音频重新收进来处理（插件中断/重启后恢复用）",

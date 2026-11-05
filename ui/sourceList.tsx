@@ -34,6 +34,7 @@ function durOf(f: any): number {
 
 /** 「9 MB · 3 分 40 秒」——时长是上传时 ffprobe 量好的。 */
 function metaOf(f: any): string {
+  if (f && f.status === "queued") return "排队中…"
   if (f && f.status === "processing") return "处理中…"
   if (f && f.status === "error") return "上次处理中断，可重新添加"
   const bits: string[] = []
@@ -72,6 +73,7 @@ export function SourceFileList(props: {
   }
   const isDone = (src: any) => Boolean(src) && (src.status === "done" || (!src.status && (src.clips || []).length > 0))
   const isProcessing = (src: any) => Boolean(src) && src.status === "processing"
+  const isQueued = (src: any) => Boolean(src) && src.status === "queued"
 
   const act = async (sourceId: string, action: string) => {
     if (!sourceId || busy) return
@@ -158,6 +160,7 @@ export function SourceFileList(props: {
             const isHidden = Boolean(f && f.hidden)
             const done = isDone(f) && !isHidden
             const proc = isProcessing(f) && !isHidden
+            const queued = isQueued(f) && !isHidden
             const job: any = jobOf(f)
             // 优先用后端随列表带回来的实时进度（恢复/续跑的素材前端没有本地 job）
             const livePct = (f && typeof f.progress === "number") ? f.progress : ((job && job.pct) || 0)
@@ -184,6 +187,8 @@ export function SourceFileList(props: {
                       <span style={{ fontSize: 11, color: "#1c8a58", background: "rgba(31,157,99,0.14)", borderRadius: 999, padding: "1px 9px", fontWeight: 600, flex: "0 0 auto" }}>完成</span>
                     ) : proc ? (
                       <span style={{ fontSize: 11, color: "#b06a00", background: "#fff4e2", borderRadius: 999, padding: "1px 9px", flex: "0 0 auto" }}>处理中</span>
+                    ) : queued ? (
+                      <span style={{ fontSize: 11, color: "#6b6b76", background: "rgba(40,37,50,0.06)", borderRadius: 999, padding: "1px 9px", flex: "0 0 auto" }}>排队中</span>
                     ) : null}
                   </Row>
                   {/* 每个文件自己的处理进度条 */}
