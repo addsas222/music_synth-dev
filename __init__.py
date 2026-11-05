@@ -170,6 +170,8 @@ class MusicSynthPlugin(NekoPluginBase):
         self._corpus_queue: list = []
         self._corpus_queue_lock = threading.Lock()
         self._corpus_worker_on = False
+        # 当前真正在处理的那条素材：删除时不能直接搬正在被 worker 读的文件
+        self._corpus_active_source = ""
         # 分片上传会话：upload_id -> {path, slot, name, size}
         self._uploads: dict[str, dict] = {}
         self._uploads_lock = threading.Lock()
@@ -2625,11 +2627,12 @@ class MusicSynthPlugin(NekoPluginBase):
     def _new_source_id() -> str:
         return time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1000) % 1000:03d}"
 
-    @staticmethod
-    def _trash_dir() -> Path:
-        root = Path(r"E:\NekoMusicSynth\_trash_20261103")
-        root.mkdir(parents=True, exist_ok=True)
-        return root
+    def _trash_dir(self) -> Path:
+        # 回收站也放在用户选择的安装根目录里，不写死到别的盘。
+        root = Path(str(self._pipeline.paths.get("compute_root") or self._data_dir))
+        d = root / "_trash"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
 
     def _trash_manifest_path(self) -> Path:
         return self._trash_dir() / "manifest.json"
@@ -2969,6 +2972,7 @@ class MusicSynthPlugin(NekoPluginBase):
             if not paths:
                 raise RuntimeError("没有可处理的素材文件")
             self._corpus_update_source(source_id, status="processing", error="")
+            self._corpus_active_source = source_id
             self._job_update(job_id, phase="processing", pct=1, stage_text="开始处理")
             corpus_py = self._train_worker("corpus_worker.py")
             sep_worker = self._train_worker("separate_worker.py")
@@ -3084,6 +3088,8 @@ class MusicSynthPlugin(NekoPluginBase):
             except Exception:  # noqa: BLE001
                 pass
         finally:
+            if str(getattr(self, "_corpus_active_source", "")) == str(source_id):
+                self._corpus_active_source = ""
             self._job_update(job_id, phase=result["phase"], pct=result["pct"],
                              stage_text=result.get("stage_text", ""),
                              error=result.get("error", ""),
@@ -3528,6 +3534,9 @@ class MusicSynthPlugin(NekoPluginBase):
 
     def _corpus_remove_source_locked(self, source_id: str):
         """把一个素材源（原文件 + 它的切片）移入回收站并从索引里摘掉。"""
+        if str(source_id) == str(getattr(self, "_corpus_active_source", "")):
+            return Ok({"ok": False,
+                       "error": "这个素材正在处理，等它处理完再删（可以先用「隐藏」）"})
         # 还在队列里等着的这条素材直接撤掉，别让它在后台白跑
         try:
             with self._corpus_queue_lock:
@@ -3563,6 +3572,11 @@ class MusicSynthPlugin(NekoPluginBase):
                         pass
         except OSError:
             pass
+        if errors and not moved:
+            # 一个都没搬走：多半是文件被占用；保留索引，让用户可以重试。
+            return Ok({"ok": False,
+                       "error": "文件正在被占用，暂时删不掉，稍后再试",
+                       "errors": errors})
         index["sources"] = [s for s in index.get("sources", []) if s.get("id") != source_id]
         self._orphans_cache = None
         self._corpus_write_index(index)
@@ -3593,9 +3607,17 @@ class MusicSynthPlugin(NekoPluginBase):
             # 搬文件 + 算哈希比较慢，放到线程里，别堵住插件的事件循环（连点删除会卡死）
             return await asyncio.to_thread(self._corpus_remove_source, str(source_id))
         if action in ("hide", "show"):
-            src["hidden"] = (action == "hide")
-            self._corpus_write_index(index)
-            return Ok({"ok": True, "source_id": source_id, "hidden": src["hidden"]})
+            # 和队列的状态更新共用同一把锁：否则后台刚写完索引，这里的 hidden
+            # 会被下一次 update 覆盖，看起来就是「隐藏了又回来」。
+            with self._corpus_lock:
+                index = self._corpus_index()
+                src = self._corpus_find_source(index, str(source_id or ""))
+                if src is None:
+                    return Ok({"ok": False, "error": f"找不到素材源 {source_id!r}"})
+                src["hidden"] = (action == "hide")
+                self._corpus_write_index(index)
+                hidden = src["hidden"]
+            return Ok({"ok": True, "source_id": source_id, "hidden": hidden})
         # preview：小文件 base64，大文件给 URL（见 _audio_payload）
         files = [f for f in (src.get("files") or []) if isinstance(f, dict) and f.get("path")]
         if not files:

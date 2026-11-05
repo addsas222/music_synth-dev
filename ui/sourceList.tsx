@@ -56,6 +56,7 @@ export function SourceFileList(props: {
   const [showHidden, setShowHidden] = useState(false)
   const [preview, setPreview] = useState<any>(null)
   const [busy, setBusy] = useState("")
+  const [errMsg, setErrMsg] = useState("")
   // 删除成功后先本地移除这一行：不用等刷新，也避免对着同一行连点
   const [removed, setRemoved] = useState<string[]>([])
 
@@ -80,18 +81,21 @@ export function SourceFileList(props: {
     // 删除：先本地收起来，立刻有反馈，也不会被连点
     if (action === "delete") setRemoved((prev) => prev.concat([sourceId]))
     setBusy(sourceId + ":" + action)
+    setErrMsg("")
     try {
       const r: any = await callEntry(props.api, "ms_corpus_source",
         { source_id: sourceId, action }, 120000)
       if (r && r.ok === false) {
         if (action === "delete") setRemoved((prev) => prev.filter((x) => x !== sourceId))
+        setErrMsg(String((r && r.error) || "操作没成功"))
         return
       }
       if (action === "delete" && preview && preview.id === sourceId) setPreview(null)
       props.onChanged()
-    } catch (e) {
+    } catch (e: any) {
       // 失败时把行放回去，保持原样
       if (action === "delete") setRemoved((prev) => prev.filter((x) => x !== sourceId))
+      setErrMsg(String((e && e.message) || e))
     } finally {
       setBusy("")
     }
@@ -134,6 +138,7 @@ export function SourceFileList(props: {
   return (
     <Col style={{ gap: 6 }}>
       {head}
+      {errMsg ? <Muted style={{ color: "#b23b3b" }}>{errMsg}</Muted> : null}
       {open && (rows.length || uploads.length) ? (
         // 固定最大高度 + 内部滚动：素材多了只滚动这块，不会把整张卡片越拉越长
         <div style={{ maxHeight: 268, overflowY: "auto", overflowX: "hidden", paddingRight: 4, display: "flex", flexDirection: "column", gap: 6 }}>

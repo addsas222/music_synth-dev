@@ -1657,6 +1657,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const [showHidden, setShowHidden] = useState(false);
     const [preview, setPreview] = useState(null);
     const [busy, setBusy] = useState("");
+    const [errMsg, setErrMsg] = useState("");
     const [removed, setRemoved] = useState([]);
     const all = Array.isArray(props.files) ? props.files : [];
     const visible = all.filter((f) => !(f && f.hidden));
@@ -1675,6 +1676,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       if (!sourceId || busy) return;
       if (action === "delete") setRemoved((prev) => prev.concat([sourceId]));
       setBusy(sourceId + ":" + action);
+      setErrMsg("");
       try {
         const r = await callEntry(
           props.api,
@@ -1684,12 +1686,14 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
         );
         if (r && r.ok === false) {
           if (action === "delete") setRemoved((prev) => prev.filter((x) => x !== sourceId));
+          setErrMsg(String(r && r.error || "操作没成功"));
           return;
         }
         if (action === "delete" && preview && preview.id === sourceId) setPreview(null);
         props.onChanged();
       } catch (e) {
         if (action === "delete") setRemoved((prev) => prev.filter((x) => x !== sourceId));
+        setErrMsg(String(e && e.message || e));
       } finally {
         setBusy("");
       }
@@ -1727,6 +1731,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     ] });
     return /* @__PURE__ */ jsxs(Col, { style: { gap: 6 }, children: [
       head,
+      errMsg ? /* @__PURE__ */ jsx(Muted, { style: { color: "#b23b3b" }, children: errMsg }) : null,
       open && (rows.length || uploads.length) ? (
         // 固定最大高度 + 内部滚动：素材多了只滚动这块，不会把整张卡片越拉越长
         /* @__PURE__ */ jsxs("div", { style: { maxHeight: 268, overflowY: "auto", overflowX: "hidden", paddingRight: 4, display: "flex", flexDirection: "column", gap: 6 }, children: [
