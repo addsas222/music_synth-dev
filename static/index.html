@@ -3259,10 +3259,6 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const poll = useRef(null);
     const [trainOpen, setTrainOpen] = useState(false);
     const [trainName, setTrainName] = useState("");
-    const [trainSource, setTrainSource] = useState("latest_run");
-    const [trainPath, setTrainPath] = useState("");
-    const [trainCaption, setTrainCaption] = useState("female pop vocal, clear, expressive");
-    const [trainLyrics, setTrainLyrics] = useState("");
     const [trainEpochs, setTrainEpochs] = useState("10");
     const [trainRank, setTrainRank] = useState("32");
     const [trainBusy, setTrainBusy] = useState("");
@@ -3377,10 +3373,6 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
         setNotice({ tone: "error", text: "ACE 环境还没就绪" });
         return;
       }
-      if (trainSource === "path" && !trainPath.trim()) {
-        setNotice({ tone: "error", text: "请先填素材目录的绝对路径" });
-        return;
-      }
       setTrainBusy("start");
       setNotice(null);
       setJob(null);
@@ -3388,10 +3380,6 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       try {
         const r = await callEntry(api, "ms_ace_train", {
           name: trainName.trim(),
-          source: trainSource,
-          path: trainPath.trim(),
-          caption: trainCaption.trim(),
-          lyrics: trainLyrics.trim(),
           epochs: Number(trainEpochs) || 10,
           rank: Number(trainRank) || 32
         }, 6e4);
@@ -3489,30 +3477,15 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
           title: "训练 ACE 音色（LoRA）",
           sub: /* @__PURE__ */ jsx(Muted, { children: "让 ACE 直接唱出目标音色，而不是每次生成后再变声" }),
           children: /* @__PURE__ */ jsxs(Col, { style: { gap: 14 }, children: [
-            /* @__PURE__ */ jsx(Muted, { children: "素材默认取最近一次「训练声音」的切片，也可以选语料库清唱或自定义目录。 训练会长时间占用显卡，期间翻唱/生成会排队。" }),
-            /* @__PURE__ */ jsxs(Grid, { cols: 2, min: 220, gap: 14, children: [
-              /* @__PURE__ */ jsx(Field, { label: "音色名（留空自动命名）", children: /* @__PURE__ */ jsx(Input, { value: trainName, placeholder: "例如 梦梦pro", onChange: (e) => setTrainName(e.target.value) }) }),
-              /* @__PURE__ */ jsx(Field, { label: "素材来源", children: /* @__PURE__ */ jsxs(Select, { value: trainSource, onChange: (e) => setTrainSource(e.target.value), children: [
-                /* @__PURE__ */ jsx("option", { value: "latest_run", children: "最近一次 DDSP 训练素材" }),
-                /* @__PURE__ */ jsx("option", { value: "corpus", children: "语料库清唱" }),
-                /* @__PURE__ */ jsx("option", { value: "path", children: "自定义目录" })
-              ] }) })
+            /* @__PURE__ */ jsxs(Muted, { children: [
+              "素材固定取「准备素材」里已经处理好的切片 （当前 ",
+              status && typeof status.train_clips === "number" ? status.train_clips : "?",
+              " 段）。 风格由系统根据音色自动判断，歌词使用通用元音，不需要你填英文。 训练会长时间占用显卡，期间翻唱/生成会排队。"
             ] }),
-            trainSource === "path" ? /* @__PURE__ */ jsx(Field, { label: "素材目录（绝对路径）", children: /* @__PURE__ */ jsx(Input, { value: trainPath, placeholder: "例如 D:\\\\我的素材\\\\梦梦", onChange: (e) => setTrainPath(e.target.value) }) }) : null,
-            /* @__PURE__ */ jsx(Field, { label: "风格描述（训练时的 caption）", children: /* @__PURE__ */ jsx(Input, { value: trainCaption, onChange: (e) => setTrainCaption(e.target.value) }) }),
-            /* @__PURE__ */ jsx(Field, { label: "歌词（可选；留空用通用元音）", children: /* @__PURE__ */ jsx(
-              "textarea",
-              {
-                style: TA_STYLE,
-                rows: 3,
-                value: trainLyrics,
-                placeholder: "有歌词效果更好；没有就留空",
-                onChange: (e) => setTrainLyrics(e.target.value)
-              }
-            ) }),
-            /* @__PURE__ */ jsxs(Grid, { cols: 2, min: 220, gap: 14, children: [
+            /* @__PURE__ */ jsxs(Grid, { cols: 3, min: 200, gap: 14, children: [
+              /* @__PURE__ */ jsx(Field, { label: "音色名（留空自动命名）", children: /* @__PURE__ */ jsx(Input, { value: trainName, placeholder: "例如 梦梦pro", onChange: (e) => setTrainName(e.target.value) }) }),
               /* @__PURE__ */ jsx(Field, { label: "训练轮数（1～100）", children: /* @__PURE__ */ jsx(Input, { type: "number", min: 1, max: 100, step: 1, value: trainEpochs, onChange: (e) => setTrainEpochs(e.target.value) }) }),
-              /* @__PURE__ */ jsx(Field, { label: "LoRA rank（4～128，越大越吃显存）", children: /* @__PURE__ */ jsx(Input, { type: "number", min: 4, max: 128, step: 4, value: trainRank, onChange: (e) => setTrainRank(e.target.value) }) })
+              /* @__PURE__ */ jsx(Field, { label: "LoRA rank（4～128）", children: /* @__PURE__ */ jsx(Input, { type: "number", min: 4, max: 128, step: 4, value: trainRank, onChange: (e) => setTrainRank(e.target.value) }) })
             ] }),
             /* @__PURE__ */ jsxs(Row, { style: { flexWrap: "wrap", alignItems: "center", gap: 12 }, children: [
               /* @__PURE__ */ jsx(Btn, { style: PRIMARY_BTN, disabled: !ready || !!trainBusy || !!busy, onClick: startTrain, children: trainBusy ? "正在训练…" : "开始训练" }),

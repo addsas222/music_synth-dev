@@ -33,6 +33,54 @@ def _audio_files(root: Path) -> list[Path]:
                   if p.is_file() and p.suffix.lower() in AUDIO_EXTS)
 
 
+def _auto_caption(files: list[Path]) -> tuple[str, str]:
+    """Listen to a few clips and describe the voice in English (for ACE) + Chinese (UI)."""
+    import numpy as np
+    import librosa
+
+    f0s, cents = [], []
+    for p in files[:6]:
+        try:
+            y, sr = librosa.load(str(p), sr=22050, mono=True, duration=20)
+            if y.size < 4096:
+                continue
+            f0 = librosa.yin(y, fmin=60, fmax=800, sr=sr, frame_length=2048)
+            f0 = f0[np.isfinite(f0)]
+            if f0.size:
+                f0s.append(float(np.median(f0)))
+            S = np.abs(librosa.stft(y, n_fft=2048, hop_length=512)) ** 2
+            freqs = librosa.fft_frequencies(sr=sr, n_fft=2048)
+            total = float(S.sum())
+            if total > 0:
+                cents.append(float((freqs * S.sum(axis=1)).sum() / total))
+        except Exception:
+            continue
+    f0 = float(np.median(f0s)) if f0s else 180.0
+    cent = float(np.median(cents)) if cents else 2000.0
+    if f0 >= 165:
+        gender, zh_gender = "female", "女声"
+    elif f0 <= 130:
+        gender, zh_gender = "male", "男声"
+    else:
+        gender, zh_gender = "androgynous", "中性声"
+    if f0 >= 260:
+        register, zh_reg = "high", "高音区"
+    elif f0 < 140:
+        register, zh_reg = "low", "低音区"
+    else:
+        register, zh_reg = "mid", "中音区"
+    if cent >= 2200:
+        timbre, zh_timbre = "bright", "偏亮"
+    elif cent < 1500:
+        timbre, zh_timbre = "warm", "偏暖"
+    else:
+        timbre, zh_timbre = "balanced", "均衡"
+    caption = (f"{gender} pop vocal, {register} register, {timbre} tone, "
+               "clear, expressive, single singer")
+    caption_zh = f"{zh_gender} · {zh_reg} · {zh_timbre}"
+    return caption, caption_zh
+
+
 def main() -> int:
     job = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
     out_path = Path(sys.argv[2])
@@ -50,16 +98,25 @@ def main() -> int:
         from acestep.training.path_safety import set_safe_root
         set_safe_root(str(project_root))
 
-        audio_dir = Path(job["audio_dir"]).resolve()
-        files = _audio_files(audio_dir)
+        # 固定通道：插件直接传「准备素材」里已处理的切片；兼容旧的 audio_dir 参数
+        paths = [Path(str(x)) for x in (job.get("audio_paths") or [])
+                 if str(x) and Path(str(x)).is_file()]
+        if paths:
+            files = paths
+            audio_dir = files[0].parent
+        else:
+            audio_dir = Path(job["audio_dir"]).resolve()
+            files = _audio_files(audio_dir)
         if not files:
             raise RuntimeError(f"素材目录里没有音频：{audio_dir}")
         if len(files) < 5:
             raise RuntimeError(f"素材太少（{len(files)} 个），至少放 5 段再训练")
 
         name = _safe_name(job.get("name") or "ace_voice")
-        caption = str(job.get("caption") or "female pop vocal, clear, expressive").strip()
-        lyrics = str(job.get("lyrics") or "").strip() or "la la la la"
+        # 不再让用户填英文风格；从素材音高/频谱自动判断
+        caption, caption_zh = _auto_caption(files)
+        lyrics = "la la la la"
+        print(f"[ace-train] auto caption: {caption} ({caption_zh})", flush=True)
         work = project_root / "train" / name
         tensors = work / "tensors"
         train_out = work / "out"
@@ -140,6 +197,7 @@ def main() -> int:
             "samples": len(samples),
             "epochs": epochs,
             "caption": caption,
+            "caption_zh": caption_zh,
         })
         print(f"[ace-train] saved LoRA to {saved}", flush=True)
     except Exception as exc:  # noqa: BLE001

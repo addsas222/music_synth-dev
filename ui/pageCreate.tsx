@@ -35,10 +35,6 @@ export function PageCreate(props: { api: any; snap: any; onRefresh: () => void; 
   const poll = useRef<any>(null)
   const [trainOpen, setTrainOpen] = useState(false)
   const [trainName, setTrainName] = useState("")
-  const [trainSource, setTrainSource] = useState("latest_run")
-  const [trainPath, setTrainPath] = useState("")
-  const [trainCaption, setTrainCaption] = useState("female pop vocal, clear, expressive")
-  const [trainLyrics, setTrainLyrics] = useState("")
   const [trainEpochs, setTrainEpochs] = useState("10")
   const [trainRank, setTrainRank] = useState("32")
   const [trainBusy, setTrainBusy] = useState("")
@@ -142,10 +138,6 @@ export function PageCreate(props: { api: any; snap: any; onRefresh: () => void; 
   const startTrain = async () => {
     if (trainBusy) return
     if (!ready) { setNotice({ tone: "error", text: "ACE 环境还没就绪" }); return }
-    if (trainSource === "path" && !trainPath.trim()) {
-      setNotice({ tone: "error", text: "请先填素材目录的绝对路径" })
-      return
-    }
     setTrainBusy("start")
     setNotice(null)
     setJob(null)
@@ -153,10 +145,6 @@ export function PageCreate(props: { api: any; snap: any; onRefresh: () => void; 
     try {
       const r: any = await callEntry(api, "ms_ace_train", {
         name: trainName.trim(),
-        source: trainSource,
-        path: trainPath.trim(),
-        caption: trainCaption.trim(),
-        lyrics: trainLyrics.trim(),
         epochs: Number(trainEpochs) || 10,
         rank: Number(trainRank) || 32,
       }, 60000)
@@ -258,39 +246,19 @@ export function PageCreate(props: { api: any; snap: any; onRefresh: () => void; 
                 sub={<Muted>让 ACE 直接唱出目标音色，而不是每次生成后再变声</Muted>}>
         <Col style={{ gap: 14 }}>
           <Muted>
-            素材默认取最近一次「训练声音」的切片，也可以选语料库清唱或自定义目录。
+            素材固定取「准备素材」里已经处理好的切片
+            （当前 {status && typeof status.train_clips === "number" ? status.train_clips : "?"} 段）。
+            风格由系统根据音色自动判断，歌词使用通用元音，不需要你填英文。
             训练会长时间占用显卡，期间翻唱/生成会排队。
           </Muted>
-          <Grid cols={2} min={220} gap={14}>
+          <Grid cols={3} min={200} gap={14}>
             <Field label="音色名（留空自动命名）">
               <Input value={trainName} placeholder="例如 梦梦pro" onChange={(e: any) => setTrainName(e.target.value)} />
             </Field>
-            <Field label="素材来源">
-              <Select value={trainSource} onChange={(e: any) => setTrainSource(e.target.value)}>
-                <option value="latest_run">最近一次 DDSP 训练素材</option>
-                <option value="corpus">语料库清唱</option>
-                <option value="path">自定义目录</option>
-              </Select>
-            </Field>
-          </Grid>
-          {trainSource === "path" ? (
-            <Field label="素材目录（绝对路径）">
-              <Input value={trainPath} placeholder="例如 D:\\我的素材\\梦梦" onChange={(e: any) => setTrainPath(e.target.value)} />
-            </Field>
-          ) : null}
-          <Field label="风格描述（训练时的 caption）">
-            <Input value={trainCaption} onChange={(e: any) => setTrainCaption(e.target.value)} />
-          </Field>
-          <Field label="歌词（可选；留空用通用元音）">
-            <textarea style={TA_STYLE} rows={3} value={trainLyrics}
-                      placeholder="有歌词效果更好；没有就留空"
-                      onChange={(e: any) => setTrainLyrics(e.target.value)} />
-          </Field>
-          <Grid cols={2} min={220} gap={14}>
             <Field label="训练轮数（1～100）">
               <Input type="number" min={1} max={100} step={1} value={trainEpochs} onChange={(e: any) => setTrainEpochs(e.target.value)} />
             </Field>
-            <Field label="LoRA rank（4～128，越大越吃显存）">
+            <Field label="LoRA rank（4～128）">
               <Input type="number" min={4} max={128} step={4} value={trainRank} onChange={(e: any) => setTrainRank(e.target.value)} />
             </Field>
           </Grid>
