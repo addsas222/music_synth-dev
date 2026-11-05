@@ -4146,11 +4146,48 @@ class MusicSynthPlugin(NekoPluginBase):
                     self._job_update(job_id, state="failed", progress=100,
                                      detail=f"入库失败：{exc}")
                     return
-                self._job_update(job_id, state="done", progress=100,
-                                 detail="生成完成：" + clean_name,
-                                 track_id=track.get("id"))
-            if sing_after and track and track.get("id"):
-                self._background_process(str(track["id"]), kind="ace")
+                if not (sing_after and track and track.get("id")):
+                    self._job_update(job_id, state="done", progress=100,
+                                     detail="生成完成：" + clean_name,
+                                     track_id=track.get("id"))
+                    return
+                # 「生成并让她唱」：同一个任务继续跑分离→变声→混音，
+                # 只有成品出来才算 100%，不把用户丢回「让她唱歌」再点一次。
+                track_id = str(track["id"])
+                self._job_update(job_id, state="running", progress=55,
+                                 detail="生成完成，正在分离人声…")
+                stop_watch = threading.Event()
+
+                def watch_progress():
+                    last = -1
+                    while not stop_watch.wait(2.5):
+                        cur = self._pipeline.store.get(track_id) or {}
+                        pct = int(cur.get("progress") or 0)
+                        mapped = min(99, 55 + int(pct * 0.44))
+                        if mapped != last:
+                            last = mapped
+                            step = str(cur.get("step") or "")
+                            self._job_update(job_id, progress=mapped,
+                                             detail="正在用当前音色唱："
+                                                    + (step or "处理中"))
+
+                watcher = threading.Thread(target=watch_progress,
+                                           name="ms-ace-sing-watch", daemon=True)
+                watcher.start()
+                try:
+                    conv = self._pipeline.process_track(track_id, None)
+                except Exception as exc:  # noqa: BLE001
+                    conv = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                finally:
+                    stop_watch.set()
+                if conv.get("ok"):
+                    self._job_update(job_id, state="done", progress=100,
+                                     detail="全部完成：已用当前音色唱好",
+                                     track_id=track_id)
+                else:
+                    self._job_update(job_id, state="failed", progress=100,
+                                     detail=str(conv.get("error") or "变声失败"),
+                                     track_id=track_id)
 
         self._thread(f"ms-ace-{job_id}", run)
         return Ok({"ok": True, "job_id": job_id, "name": clean_name,
