@@ -3910,6 +3910,8 @@ class MusicSynthPlugin(NekoPluginBase):
             if not cand.is_dir():
                 return Ok({"ok": False, "error": f"找不到 ACE 音色：{lora_name}"})
             lora_path = str(cand)
+        # 选了 ACE 音色时，ACE 唱出来就是目标音色，不再走 DDSP 二次变声。
+        sing_after = _as_bool(auto_sing) and not lora_path
         try:
             p["output"].mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -3970,7 +3972,7 @@ class MusicSynthPlugin(NekoPluginBase):
                 self._job_update(job_id, state="done", progress=100,
                                  detail="生成完成：" + clean_name,
                                  track_id=track.get("id"))
-            if _as_bool(auto_sing) and track and track.get("id"):
+            if sing_after and track and track.get("id"):
                 self._background_process(str(track["id"]), kind="ace")
 
         self._thread(f"ms-ace-{job_id}", run)

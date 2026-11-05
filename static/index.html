@@ -3259,7 +3259,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
           bpm: Number(bpm) || 0,
           language,
           instrumental,
-          auto_sing: sing,
+          auto_sing: sing && !lora.trim(),
           inference_steps: 12,
           guidance_scale: 7,
           lora
@@ -3398,10 +3398,11 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
               /* @__PURE__ */ jsx("option", { value: "", children: "默认音色（不加载 LoRA）" }),
               loras.map((l) => /* @__PURE__ */ jsx("option", { value: l.name, children: l.name }, l.name))
             ] }) }),
+            lora ? /* @__PURE__ */ jsx(Muted, { children: "已选 ACE 音色：生成结果直接就是该音色，不会再走 DDSP 二次变声。" }) : null,
             /* @__PURE__ */ jsx(Row, { style: { flexWrap: "wrap", alignItems: "center", gap: 14 }, children: /* @__PURE__ */ jsx(Muted, { children: "首次加载 ACE 模型会慢一些；同一时间只跑一个生成/唱的任务。" }) }),
             /* @__PURE__ */ jsxs(Row, { style: { flexWrap: "wrap", gap: 8 }, children: [
               /* @__PURE__ */ jsx(Btn, { disabled: !!busy || !ready, onClick: () => start(false), children: "只生成" }),
-              /* @__PURE__ */ jsx(Btn, { style: PRIMARY_BTN, disabled: !!busy || !ready, onClick: () => start(true), children: busy ? "正在生成…" : "生成并让她唱" }),
+              /* @__PURE__ */ jsx(Btn, { style: PRIMARY_BTN, disabled: !!busy || !ready, onClick: () => start(true), children: busy ? "正在生成…" : lora ? "用这个 ACE 音色生成" : "生成并让她唱" }),
               /* @__PURE__ */ jsx(Btn, { disabled: !!busy, onClick: check, children: "重新检查环境" })
             ] })
           ] })

@@ -97,7 +97,7 @@ export function PageCreate(props: { api: any; snap: any; onRefresh: () => void; 
         bpm: Number(bpm) || 0,
         language,
         instrumental,
-        auto_sing: sing,
+        auto_sing: sing && !lora.trim(),
         inference_steps: 12,
         guidance_scale: 7.0,
         lora,
@@ -237,13 +237,16 @@ export function PageCreate(props: { api: any; snap: any; onRefresh: () => void; 
               {loras.map((l: any) => <option key={l.name} value={l.name}>{l.name}</option>)}
             </Select>
           </Field>
+          {lora ? (
+            <Muted>已选 ACE 音色：生成结果直接就是该音色，不会再走 DDSP 二次变声。</Muted>
+          ) : null}
           <Row style={{ flexWrap: "wrap", alignItems: "center", gap: 14 }}>
             <Muted>首次加载 ACE 模型会慢一些；同一时间只跑一个生成/唱的任务。</Muted>
           </Row>
           <Row style={{ flexWrap: "wrap", gap: 8 }}>
             <Btn disabled={!!busy || !ready} onClick={() => start(false)}>只生成</Btn>
             <Btn style={PRIMARY_BTN} disabled={!!busy || !ready} onClick={() => start(true)}>
-              {busy ? "正在生成…" : "生成并让她唱"}
+              {busy ? "正在生成…" : (lora ? "用这个 ACE 音色生成" : "生成并让她唱")}
             </Btn>
             <Btn disabled={!!busy} onClick={check}>重新检查环境</Btn>
           </Row>
