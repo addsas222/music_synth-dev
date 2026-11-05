@@ -35,14 +35,20 @@ export function PageCreate(props: { api: any; snap: any; onRefresh: () => void; 
   const poll = useRef<any>(null)
   const [trainOpen, setTrainOpen] = useState(false)
   const [trainName, setTrainName] = useState("")
-  const [trainEpochs, setTrainEpochs] = useState("10")
-  const [trainRank, setTrainRank] = useState("32")
+  const [trainEpochs, setTrainEpochs] = useState("")
+  const [trainRank, setTrainRank] = useState("")
+  const trainTouched = useRef(false)
   const [trainBusy, setTrainBusy] = useState("")
 
   const check = async () => {
     try {
       const r: any = await callEntry(api, "ms_ace_status", {}, 30000)
       setStatus(r)
+      const td = r && r.train_defaults
+      if (td && !trainTouched.current) {
+        setTrainEpochs(String(td.epochs || ""))
+        setTrainRank(String(td.rank || ""))
+      }
     } catch (e: any) {
       setStatus({ ok: false, problems: [String((e && e.message) || e)] })
     }
@@ -145,8 +151,8 @@ export function PageCreate(props: { api: any; snap: any; onRefresh: () => void; 
     try {
       const r: any = await callEntry(api, "ms_ace_train", {
         name: trainName.trim(),
-        epochs: Number(trainEpochs) || 10,
-        rank: Number(trainRank) || 32,
+        epochs: Number(trainEpochs) || 0,
+        rank: Number(trainRank) || 0,
       }, 60000)
       if (r && r.ok && r.job_id) {
         setJobId(String(r.job_id))
@@ -256,12 +262,27 @@ export function PageCreate(props: { api: any; snap: any; onRefresh: () => void; 
               <Input value={trainName} placeholder="例如 梦梦pro" onChange={(e: any) => setTrainName(e.target.value)} />
             </Field>
             <Field label="训练轮数（1～100）">
-              <Input type="number" min={1} max={100} step={1} value={trainEpochs} onChange={(e: any) => setTrainEpochs(e.target.value)} />
+              <Input type="number" min={1} max={100} step={1} value={trainEpochs}
+                     onChange={(e: any) => { trainTouched.current = true; setTrainEpochs(e.target.value) }} />
             </Field>
             <Field label="LoRA rank（4～128）">
-              <Input type="number" min={4} max={128} step={4} value={trainRank} onChange={(e: any) => setTrainRank(e.target.value)} />
+              <Input type="number" min={4} max={128} step={4} value={trainRank}
+                     onChange={(e: any) => { trainTouched.current = true; setTrainRank(e.target.value) }} />
             </Field>
           </Grid>
+          {status && status.train_defaults ? (
+            <Row style={{ flexWrap: "wrap", gap: 8, alignItems: "center" }}>
+              <Muted>
+                系统推荐：{status.train_defaults.epochs} 轮 · rank {status.train_defaults.rank}
+                （{status.train_defaults.reason}）
+              </Muted>
+              <Btn onClick={() => {
+                trainTouched.current = false
+                setTrainEpochs(String(status.train_defaults.epochs || ""))
+                setTrainRank(String(status.train_defaults.rank || ""))
+              }}>恢复推荐</Btn>
+            </Row>
+          ) : null}
           <Row style={{ flexWrap: "wrap", alignItems: "center", gap: 12 }}>
             <Btn style={PRIMARY_BTN} disabled={!ready || !!trainBusy || !!busy} onClick={startTrain}>
               {trainBusy ? "正在训练…" : "开始训练"}

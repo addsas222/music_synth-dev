@@ -3259,13 +3259,19 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const poll = useRef(null);
     const [trainOpen, setTrainOpen] = useState(false);
     const [trainName, setTrainName] = useState("");
-    const [trainEpochs, setTrainEpochs] = useState("10");
-    const [trainRank, setTrainRank] = useState("32");
+    const [trainEpochs, setTrainEpochs] = useState("");
+    const [trainRank, setTrainRank] = useState("");
+    const trainTouched = useRef(false);
     const [trainBusy, setTrainBusy] = useState("");
     const check = async () => {
       try {
         const r = await callEntry(api, "ms_ace_status", {}, 3e4);
         setStatus(r);
+        const td = r && r.train_defaults;
+        if (td && !trainTouched.current) {
+          setTrainEpochs(String(td.epochs || ""));
+          setTrainRank(String(td.rank || ""));
+        }
       } catch (e) {
         setStatus({ ok: false, problems: [String(e && e.message || e)] });
       }
@@ -3380,8 +3386,8 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       try {
         const r = await callEntry(api, "ms_ace_train", {
           name: trainName.trim(),
-          epochs: Number(trainEpochs) || 10,
-          rank: Number(trainRank) || 32
+          epochs: Number(trainEpochs) || 0,
+          rank: Number(trainRank) || 0
         }, 6e4);
         if (r && r.ok && r.job_id) {
           setJobId(String(r.job_id));
@@ -3484,9 +3490,51 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
             ] }),
             /* @__PURE__ */ jsxs(Grid, { cols: 3, min: 200, gap: 14, children: [
               /* @__PURE__ */ jsx(Field, { label: "音色名（留空自动命名）", children: /* @__PURE__ */ jsx(Input, { value: trainName, placeholder: "例如 梦梦pro", onChange: (e) => setTrainName(e.target.value) }) }),
-              /* @__PURE__ */ jsx(Field, { label: "训练轮数（1～100）", children: /* @__PURE__ */ jsx(Input, { type: "number", min: 1, max: 100, step: 1, value: trainEpochs, onChange: (e) => setTrainEpochs(e.target.value) }) }),
-              /* @__PURE__ */ jsx(Field, { label: "LoRA rank（4～128）", children: /* @__PURE__ */ jsx(Input, { type: "number", min: 4, max: 128, step: 4, value: trainRank, onChange: (e) => setTrainRank(e.target.value) }) })
+              /* @__PURE__ */ jsx(Field, { label: "训练轮数（1～100）", children: /* @__PURE__ */ jsx(
+                Input,
+                {
+                  type: "number",
+                  min: 1,
+                  max: 100,
+                  step: 1,
+                  value: trainEpochs,
+                  onChange: (e) => {
+                    trainTouched.current = true;
+                    setTrainEpochs(e.target.value);
+                  }
+                }
+              ) }),
+              /* @__PURE__ */ jsx(Field, { label: "LoRA rank（4～128）", children: /* @__PURE__ */ jsx(
+                Input,
+                {
+                  type: "number",
+                  min: 4,
+                  max: 128,
+                  step: 4,
+                  value: trainRank,
+                  onChange: (e) => {
+                    trainTouched.current = true;
+                    setTrainRank(e.target.value);
+                  }
+                }
+              ) })
             ] }),
+            status && status.train_defaults ? /* @__PURE__ */ jsxs(Row, { style: { flexWrap: "wrap", gap: 8, alignItems: "center" }, children: [
+              /* @__PURE__ */ jsxs(Muted, { children: [
+                "系统推荐：",
+                status.train_defaults.epochs,
+                " 轮 · rank ",
+                status.train_defaults.rank,
+                "（",
+                status.train_defaults.reason,
+                "）"
+              ] }),
+              /* @__PURE__ */ jsx(Btn, { onClick: () => {
+                trainTouched.current = false;
+                setTrainEpochs(String(status.train_defaults.epochs || ""));
+                setTrainRank(String(status.train_defaults.rank || ""));
+              }, children: "恢复推荐" })
+            ] }) : null,
             /* @__PURE__ */ jsxs(Row, { style: { flexWrap: "wrap", alignItems: "center", gap: 12 }, children: [
               /* @__PURE__ */ jsx(Btn, { style: PRIMARY_BTN, disabled: !ready || !!trainBusy || !!busy, onClick: startTrain, children: trainBusy ? "正在训练…" : "开始训练" }),
               /* @__PURE__ */ jsx(Muted, { children: "首次训练约 10～40 分钟，取决于素材量和轮数；显卡显存占用约 6～10GB。" })

@@ -3883,13 +3883,14 @@ class MusicSynthPlugin(NekoPluginBase):
                 rows.append({"name": d.name, "path": str(d)})
         return rows
 
-    def _ace_train_clips(self) -> list:
-        """ACE 训练素材固定来自「准备素材」语料库里已处理的切片。"""
+    def _ace_train_stats(self) -> dict:
+        """素材切片 + 总时长，用于动态推荐训练参数。"""
         try:
             index = self._corpus_index()
         except Exception:  # noqa: BLE001
-            return []
+            index = {}
         buckets = {"dry_sing": [], "song": [], "speech": []}
+        seconds = {"dry_sing": 0.0, "song": 0.0, "speech": 0.0}
         for src in index.get("sources", []):
             if src.get("hidden"):
                 continue
@@ -3898,12 +3899,77 @@ class MusicSynthPlugin(NekoPluginBase):
                 continue
             for c in src.get("clips", []):
                 p = Path(str((c or {}).get("path") or ""))
-                if p.is_file():
-                    buckets[slot].append(p)
+                if not p.is_file():
+                    continue
+                buckets[slot].append(p)
+                try:
+                    seconds[slot] += float((c or {}).get("dur_s") or 0.0)
+                except (TypeError, ValueError):
+                    pass
         clips = buckets["dry_sing"] + buckets["song"]
+        total = seconds["dry_sing"] + seconds["song"]
         if len(clips) < 20:
             clips += buckets["speech"]
-        return clips
+            total += seconds["speech"]
+        return {"clips": clips, "count": len(clips), "seconds": round(total, 1)}
+
+    def _ace_train_recommend(self) -> dict:
+        """按素材量 + 当前空闲显存给训练轮数 / LoRA rank 推荐。"""
+        stats = self._ace_train_stats()
+        minutes = float(stats["seconds"]) / 60.0
+        count = int(stats["count"])
+        try:
+            probe = runtime.probe_hardware(force=False)
+            gpu = probe.get("gpu") or {}
+            free = float(gpu.get("free_gib") or 0.0)
+            ram_free = float(probe.get("ram_available_gib") or 0.0)
+        except Exception:  # noqa: BLE001
+            free, ram_free = 0.0, 0.0
+        # rank：先看显存，再按素材量封顶（素材越少，rank 越保守）
+        if free >= 16:
+            rank = 64
+        elif free >= 12:
+            rank = 48
+        elif free >= 8:
+            rank = 32
+        else:
+            rank = 16
+        if minutes < 5:
+            rank = min(rank, 16)
+        elif minutes < 15:
+            rank = min(rank, 32)
+        elif minutes < 40:
+            rank = min(rank, 48)
+        # 轮数：素材越多，单轮信息量越大，轮数反而可以少
+        if minutes < 5:
+            epochs = 30
+        elif minutes < 15:
+            epochs = 20
+        elif minutes < 40:
+            epochs = 12
+        elif minutes < 90:
+            epochs = 8
+        else:
+            epochs = 6
+        if count and count < 20:
+            epochs = min(40, epochs + 5)
+        accum = 8 if free < 10 or ram_free < 12 else 4
+        return {
+            "epochs": int(max(3, min(60, epochs))),
+            "rank": int(max(8, min(64, rank))),
+            "alpha": int(max(16, min(128, rank * 2))),
+            "batch": 1,
+            "gradient_accumulation": int(accum),
+            "clips": count,
+            "minutes": round(minutes, 1),
+            "free_gib": round(free, 1),
+            "reason": (f"{count} 段 · 约 {minutes:.0f} 分钟素材，"
+                       f"空闲显存 {free:.1f}GB"),
+        }
+
+    def _ace_train_clips(self) -> list:
+        """ACE 训练素材固定来自「准备素材」语料库里已处理的切片。"""
+        return self._ace_train_stats()["clips"]
 
     def _ace_problems(self) -> list:
         p = self._ace_paths()
@@ -3960,7 +4026,8 @@ class MusicSynthPlugin(NekoPluginBase):
         return Ok({"ok": not problems, "ready": not problems, "problems": problems,
                    "paths": {k: str(v) for k, v in p.items()},
                    "loras": self._ace_loras(),
-                   "train_clips": len(self._ace_train_clips())})
+                   "train_clips": len(self._ace_train_clips()),
+                   "train_defaults": self._ace_train_recommend()})
 
     @plugin_entry(id="ms_ace_generate", name="为她而唱 · 原创歌曲",
                   description="用 ACE-Step text2music 按风格描述+歌词生成整首歌；可选 auto_sing 直接走现有变声链路",
@@ -4107,15 +4174,15 @@ class MusicSynthPlugin(NekoPluginBase):
                   description="用「准备素材」里已处理的切片训练 ACE-Step 音色 LoRA；风格由系统自动判断",
                   input_schema={"type": "object", "properties": {
                       "name": {"type": "string", "description": "音色名"},
-                      "epochs": {"type": "integer", "minimum": 1, "maximum": 100},
-                      "rank": {"type": "integer", "minimum": 4, "maximum": 128},
-                      "alpha": {"type": "integer", "minimum": 4, "maximum": 256},
+                      "epochs": {"type": "integer", "minimum": 0, "maximum": 100},
+                      "rank": {"type": "integer", "minimum": 0, "maximum": 128},
+                      "alpha": {"type": "integer", "minimum": 0, "maximum": 256},
                       "batch": {"type": "integer", "minimum": 1, "maximum": 8},
                       "gradient_accumulation": {"type": "integer", "minimum": 1, "maximum": 32},
                       "max_duration": {"type": "number"}}})
     async def ms_ace_train(self, name: str = "",
-                           epochs: int = 10, rank: int = 32, alpha: int = 64,
-                           batch: int = 1, gradient_accumulation: int = 4,
+                           epochs: int = 0, rank: int = 0, alpha: int = 0,
+                           batch: int = 0, gradient_accumulation: int = 0,
                            max_duration: float = 60.0, **_):
         if not self._pipeline.paths.get("configured"):
             return Ok({"ok": False,
@@ -4131,6 +4198,12 @@ class MusicSynthPlugin(NekoPluginBase):
         clean_name = re.sub(r'[\\/:*?"<>|\s]+', "_", str(name or "").strip())[:40] \
             or ("ace_" + time.strftime("%m%d_%H%M%S"))
         p = self._ace_paths()
+        rec = self._ace_train_recommend()
+        epochs = max(1, min(100, int(epochs or rec["epochs"])))
+        rank = max(4, min(128, int(rank or rec["rank"])))
+        alpha = max(4, min(256, int(alpha or rec["alpha"])))
+        batch = max(1, min(8, int(batch or rec["batch"])))
+        accum = max(1, min(32, int(gradient_accumulation or rec["gradient_accumulation"])))
         job_id = self._job_begin("ace-train")
         job = {
             "plugin_dir": str(self._plugin_dir),
@@ -4139,11 +4212,11 @@ class MusicSynthPlugin(NekoPluginBase):
             # 固定通道：直接用「准备素材」语料库里已处理好的切片
             "audio_paths": [str(c) for c in clips],
             "name": clean_name,
-            "epochs": max(1, min(100, int(epochs or 10))),
-            "rank": max(4, min(128, int(rank or 32))),
-            "alpha": max(4, min(256, int(alpha or 64))),
-            "batch": max(1, min(8, int(batch or 1))),
-            "gradient_accumulation": max(1, min(32, int(gradient_accumulation or 4))),
+            "epochs": epochs,
+            "rank": rank,
+            "alpha": alpha,
+            "batch": batch,
+            "gradient_accumulation": accum,
             "max_duration": max(5.0, min(240.0, float(max_duration or 60.0))),
             "device": "cuda",
             "precision": "bf16",
