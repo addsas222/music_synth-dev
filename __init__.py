@@ -3752,6 +3752,50 @@ class MusicSynthPlugin(NekoPluginBase):
             "output": Path(self._pipeline.work_dir) / "ace",
         }
 
+    def _ace_loras(self) -> list:
+        """Installed ACE voice adapters under <compute_root>/acestep/loras."""
+        base = self._ace_paths()["root"] / "loras"
+        rows = []
+        if not base.is_dir():
+            return rows
+        for d in sorted(base.iterdir()):
+            if not d.is_dir():
+                continue
+            has = any((d / f).is_file() for f in (
+                "adapter_config.json", "adapter_model.bin",
+                "adapter_model.safetensors"))
+            if has:
+                rows.append({"name": d.name, "path": str(d)})
+        return rows
+
+    def _ace_train_source(self, source: str, path: str):
+        """Resolve the ACE LoRA training audio directory."""
+        root = Path(str(self._pipeline.paths.get("compute_root") or ""))
+        source = str(source or "latest_run").strip()
+        if source == "path":
+            p = Path(str(path or "")).expanduser()
+            if not p.is_absolute() or not p.is_dir():
+                raise ValueError("请填一个存在的绝对素材目录")
+        elif source == "corpus":
+            p = root / "corpus" / "dry_sing"
+        else:
+            runs = root / "train_runs"
+            candidates = []
+            if runs.is_dir():
+                for d in runs.iterdir():
+                    aud = d / "data" / "train" / "audio"
+                    if aud.is_dir():
+                        candidates.append(aud)
+            candidates.sort(key=lambda x: x.stat().st_mtime if x.exists() else 0,
+                            reverse=True)
+            if not candidates:
+                raise ValueError("还没有 DDSP 训练素材；先去「训练声音」放素材，或改用自定义目录")
+            p = candidates[0]
+        exts = {".wav", ".flac", ".mp3", ".m4a", ".ogg", ".aac", ".wma"}
+        count = sum(1 for f in p.rglob("*")
+                    if f.is_file() and f.suffix.lower() in exts)
+        return p, count
+
     def _ace_problems(self) -> list:
         p = self._ace_paths()
         problems = []
@@ -3760,7 +3804,8 @@ class MusicSynthPlugin(NekoPluginBase):
         if not p["pylibs"].is_dir():
             problems.append("ACE 依赖目录 acestep\\pylibs")
         else:
-            for pkg in ("transformers", "diffusers", "loguru", "accelerate", "win32_setctime"):
+            for pkg in ("transformers", "diffusers", "loguru", "accelerate",
+                        "win32_setctime", "peft"):
                 if not (p["pylibs"] / pkg).exists():
                     problems.append(f"ACE 依赖 {pkg}")
                     break
@@ -3804,7 +3849,8 @@ class MusicSynthPlugin(NekoPluginBase):
         p = self._ace_paths()
         problems = self._ace_problems()
         return Ok({"ok": not problems, "ready": not problems, "problems": problems,
-                   "paths": {k: str(v) for k, v in p.items()}})
+                   "paths": {k: str(v) for k, v in p.items()},
+                   "loras": self._ace_loras()})
 
     @plugin_entry(id="ms_ace_generate", name="为她而唱 · 原创歌曲",
                   description="用 ACE-Step text2music 按风格描述+歌词生成整首歌；可选 auto_sing 直接走现有变声链路",
@@ -3819,12 +3865,13 @@ class MusicSynthPlugin(NekoPluginBase):
                       "auto_sing": {"type": "boolean", "description": "生成后直接用当前音色唱"},
                       "inference_steps": {"type": "integer", "minimum": 1, "maximum": 60},
                       "guidance_scale": {"type": "number"},
-                      "seed": {"type": "integer"}}})
+                      "seed": {"type": "integer"},
+                      "lora": {"type": "string", "description": "ACE 音色 LoRA 名字；留空=默认音色"}}})
     async def ms_ace_generate(self, prompt: str = "", lyrics: str = "", name: str = "",
                               duration: int = 0, bpm: int = 0, language: str = "auto",
                               instrumental=False, auto_sing=False,
                               inference_steps: int = 12, guidance_scale: float = 7.0,
-                              seed: int = -1, **_):
+                              seed: int = -1, lora: str = "", **_):
         if not self._pipeline.paths.get("configured"):
             return Ok({"ok": False,
                        "error": "还没有选择安装位置，请先到安装向导/设置里选一个目录"})
@@ -3856,6 +3903,13 @@ class MusicSynthPlugin(NekoPluginBase):
         if _as_bool(instrumental):
             lang = "unknown"
         p = self._ace_paths()
+        lora_name = str(lora or "").strip()
+        lora_path = ""
+        if lora_name:
+            cand = p["root"] / "loras" / lora_name
+            if not cand.is_dir():
+                return Ok({"ok": False, "error": f"找不到 ACE 音色：{lora_name}"})
+            lora_path = str(cand)
         try:
             p["output"].mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -3866,6 +3920,7 @@ class MusicSynthPlugin(NekoPluginBase):
             "project_root": str(p["root"]),
             "pylibs": str(p["pylibs"]),
             "output_dir": str(p["output"]),
+            "lora_path": lora_path,
             "prompt": prompt,
             "lyrics": lyrics,
             "name": clean_name,
@@ -3930,6 +3985,94 @@ class MusicSynthPlugin(NekoPluginBase):
             job = dict(self._jobs.get(str(job_id)) or {})
         return Ok({"found": bool(job), "job": job})
 
+    @plugin_entry(id="ms_ace_loras", name="为她而唱 · ACE 音色列表",
+                  description="列出已经训练好的 ACE 音色 LoRA",
+                  input_schema={"type": "object", "properties": {}})
+    async def ms_ace_loras(self, **_):
+        return Ok({"ok": True, "loras": self._ace_loras()})
+
+    @plugin_entry(id="ms_ace_train", name="为她而唱 · 训练 ACE 音色",
+                  description="用现有素材训练 ACE-Step 音色 LoRA；训练时长时间占用显卡",
+                  input_schema={"type": "object", "properties": {
+                      "name": {"type": "string", "description": "音色名"},
+                      "source": {"type": "string", "enum": ["latest_run", "corpus", "path"]},
+                      "path": {"type": "string", "description": "source=path 时的绝对素材目录"},
+                      "caption": {"type": "string", "description": "风格描述"},
+                      "lyrics": {"type": "string", "description": "可选；留空用通用元音"},
+                      "epochs": {"type": "integer", "minimum": 1, "maximum": 100},
+                      "rank": {"type": "integer", "minimum": 4, "maximum": 128},
+                      "alpha": {"type": "integer", "minimum": 4, "maximum": 256},
+                      "batch": {"type": "integer", "minimum": 1, "maximum": 8},
+                      "gradient_accumulation": {"type": "integer", "minimum": 1, "maximum": 32},
+                      "max_duration": {"type": "number"}}})
+    async def ms_ace_train(self, name: str = "", source: str = "latest_run",
+                           path: str = "", caption: str = "", lyrics: str = "",
+                           epochs: int = 10, rank: int = 32, alpha: int = 64,
+                           batch: int = 1, gradient_accumulation: int = 4,
+                           max_duration: float = 60.0, **_):
+        if not self._pipeline.paths.get("configured"):
+            return Ok({"ok": False,
+                       "error": "还没有选择安装位置，请先到安装向导/设置里选一个目录"})
+        problems = self._ace_problems()
+        if problems:
+            return Ok({"ok": False, "error": "ACE 环境还没就绪，缺少 " + "、".join(problems)})
+        try:
+            audio_dir, count = self._ace_train_source(source, path)
+        except ValueError as exc:
+            return Ok({"ok": False, "error": str(exc)})
+        if count < 5:
+            return Ok({"ok": False,
+                       "error": f"可用素材只有 {count} 段，至少需要 5 段（越多越好）"})
+        clean_name = re.sub(r'[\\/:*?"<>|\s]+', "_", str(name or "").strip())[:40] \
+            or ("ace_" + time.strftime("%m%d_%H%M%S"))
+        p = self._ace_paths()
+        job_id = self._job_begin("ace-train")
+        job = {
+            "plugin_dir": str(self._plugin_dir),
+            "project_root": str(p["root"]),
+            "pylibs": str(p["pylibs"]),
+            "audio_dir": str(audio_dir),
+            "name": clean_name,
+            "caption": str(caption or "").strip(),
+            "lyrics": str(lyrics or "").strip(),
+            "epochs": max(1, min(100, int(epochs or 10))),
+            "rank": max(4, min(128, int(rank or 32))),
+            "alpha": max(4, min(256, int(alpha or 64))),
+            "batch": max(1, min(8, int(batch or 1))),
+            "gradient_accumulation": max(1, min(32, int(gradient_accumulation or 4))),
+            "max_duration": max(5.0, min(240.0, float(max_duration or 60.0))),
+            "device": "cuda",
+            "precision": "bf16",
+        }
+
+        def run():
+            self._job_update(job_id, state="queued",
+                             detail="排队中：训练会长时间占用显卡")
+            with self._process_lock:
+                self._job_update(job_id, state="running", progress=5,
+                                 detail=f"正在用 {count} 段素材训练「{clean_name}」（首次较久）")
+                try:
+                    result = runtime.run_worker(
+                        p["python"], self._train_worker("ace_train_worker.py"),
+                        job, cwd=p["output"], timeout=21600,
+                        log_path=self._pipeline.log_path)
+                except Exception as exc:  # noqa: BLE001
+                    self._job_update(job_id, state="failed", progress=100,
+                                     detail=f"{type(exc).__name__}: {exc}")
+                    return
+                if not result.get("ok"):
+                    self._job_update(job_id, state="failed", progress=100,
+                                     detail=str(result.get("error") or "ACE 训练失败"))
+                    return
+                self._job_update(job_id, state="done", progress=100,
+                                 detail=f"训练完成：「{clean_name}」",
+                                 lora_path=result.get("lora_path"),
+                                 samples=result.get("samples"))
+
+        self._thread(f"ms-ace-train-{job_id}", run)
+        return Ok({"ok": True, "job_id": job_id, "name": clean_name,
+                   "audio_dir": str(audio_dir), "samples": count})
+
     @plugin_entry(id="ms_ace_install", name="为她而唱 · 安装 ACE 依赖",
                   description="把 ACE 需要的 Python 依赖装到计算根目录的 acestep\\pylibs（模型会在首次生成时自动下载）",
                   input_schema={"type": "object", "properties": {}})
@@ -3947,7 +4090,8 @@ class MusicSynthPlugin(NekoPluginBase):
         job_id = self._job_begin("ace-install")
         packages = [
             "diffusers==0.36.0", "loguru", "accelerate", "win32-setctime",
-            "transformers==4.28.1", "tokenizers==0.13.3", "huggingface_hub==0.13.4",
+            "transformers==4.51.3", "tokenizers==0.21.1", "huggingface_hub==0.30.2",
+            "peft==0.4.0", "psutil",
         ]
 
         def run():

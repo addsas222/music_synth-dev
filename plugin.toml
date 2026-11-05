@@ -4,7 +4,7 @@ name = "为她而唱"
 description = "全自动变声翻唱模块：采集 AI 正在听的歌 → 按静音/标题切歌 → 分离人声与伴奏 → 用 DDSP-SVC 6.3（RectifiedFlow）把原唱声线转换到目标音色 → 混回伴奏 → 面板出曲、AI 可调用演唱。"
 short_description = "听歌识歌、人声分离、DDSP-SVC 音色转换翻唱，一键出成品并让 AI 唱出来"
 keywords = ["唱歌", "翻唱", "变声", "音色转换", "DDSP-SVC", "人声分离", "SVC", "sing", "cover", "vocal", "voice conversion"]
-version = "0.2.4"
+version = "0.2.5"
 type = "plugin"
 entry = "plugin.plugins.music_synth:MusicSynthPlugin"
 
@@ -357,3 +357,15 @@ id = "ms_ace_install"
 name = "为她而唱 · 安装 ACE 依赖"
 description = "把 ACE 需要的 Python 依赖装到计算根目录的 acestep/pylibs（模型会在首次生成时自动下载）"
 input_schema = { type = "object", properties = {  } }
+
+[[plugin.entries]]
+id = "ms_ace_loras"
+name = "为她而唱 · ACE 音色列表"
+description = "列出已经训练好的 ACE 音色 LoRA"
+input_schema = { type = "object", properties = {  } }
+
+[[plugin.entries]]
+id = "ms_ace_train"
+name = "为她而唱 · 训练 ACE 音色"
+description = "用现有素材训练 ACE-Step 音色 LoRA；训练时长时间占用显卡"
+input_schema = { type = "object", properties = { name = { type = "string" }, source = { type = "string", enum = ["latest_run", "corpus", "path"] }, path = { type = "string" }, caption = { type = "string" }, lyrics = { type = "string" }, epochs = { type = "integer", minimum = 1, maximum = 100 }, rank = { type = "integer", minimum = 4, maximum = 128 }, alpha = { type = "integer", minimum = 4, maximum = 256 }, batch = { type = "integer", minimum = 1, maximum = 8 }, gradient_accumulation = { type = "integer", minimum = 1, maximum = 32 }, max_duration = { type = "number" } } }

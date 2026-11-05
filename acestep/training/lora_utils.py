@@ -31,6 +31,29 @@ except ImportError:
 from acestep.training.configs import LoRAConfig
 
 
+def _unwrap_decoder(module: Any) -> Any:
+    """Return the PEFT-wrapped decoder, peeling only Fabric/compile wrappers.
+
+    Never peel PEFT's ``base_model`` / ``model``: ``PeftModel.save_pretrained``
+    must be the one called so only adapter weights are written.
+    """
+    if module is not None and hasattr(module, "decoder"):
+        module = module.decoder
+    seen = set()
+    while module is not None and id(module) not in seen:
+        seen.add(id(module))
+        if module.__class__.__name__.startswith("PeftModel"):
+            break
+        for attr in ("_forward_module", "_orig_mod"):
+            inner = getattr(module, attr, None)
+            if isinstance(inner, nn.Module) and inner is not module:
+                module = inner
+                break
+        else:
+            break
+    return module
+
+
 def check_peft_available() -> bool:
     """Check if PEFT library is available."""
     return PEFT_AVAILABLE

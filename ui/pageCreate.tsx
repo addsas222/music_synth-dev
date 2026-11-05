@@ -4,7 +4,7 @@
 // 「生成并让她唱」会直接复用现有链路：分离 → DDSP 变声 → 混音。
 import { Alert, StatusBadge, useEffect, useRef, useState } from "@neko/plugin-ui"
 import { callEntry } from "./api"
-import { BRAND_DEEP, INK, INK_2, Btn, Col, Field, Grid, Input, Muted, Panel, PRIMARY_BTN, Pill, Row, Section, Select, Toggle } from "./ui"
+import { BRAND_DEEP, INK, INK_2, Btn, Col, Field, FoldCard, Grid, Input, Muted, Panel, PRIMARY_BTN, Pill, Row, Section, Select, Toggle } from "./ui"
 
 const TA_STYLE = {
   border: "1px solid transparent", borderRadius: 12, padding: "9px 14px", fontSize: 13,
@@ -27,11 +27,21 @@ export function PageCreate(props: { api: any; snap: any; onRefresh: () => void; 
   const [bpm, setBpm] = useState("0")
   const [language, setLanguage] = useState("auto")
   const [instrumental, setInstrumental] = useState(false)
+  const [lora, setLora] = useState("")
   const [busy, setBusy] = useState("")
   const [jobId, setJobId] = useState("")
   const [job, setJob] = useState<any>(null)
   const [notice, setNotice] = useState<any>(null)
   const poll = useRef<any>(null)
+  const [trainOpen, setTrainOpen] = useState(false)
+  const [trainName, setTrainName] = useState("")
+  const [trainSource, setTrainSource] = useState("latest_run")
+  const [trainPath, setTrainPath] = useState("")
+  const [trainCaption, setTrainCaption] = useState("female pop vocal, clear, expressive")
+  const [trainLyrics, setTrainLyrics] = useState("")
+  const [trainEpochs, setTrainEpochs] = useState("10")
+  const [trainRank, setTrainRank] = useState("32")
+  const [trainBusy, setTrainBusy] = useState("")
 
   const check = async () => {
     try {
@@ -53,6 +63,11 @@ export function PageCreate(props: { api: any; snap: any; onRefresh: () => void; 
         if (j && (j.state === "done" || j.state === "failed")) {
           if (poll.current) { clearInterval(poll.current); poll.current = null }
           setBusy("")
+          setTrainBusy("")
+          if (j.state === "done" && j.lora_path) {
+            const parts = String(j.lora_path).split(/[\\/]/)
+            setLora(parts[parts.length - 1] || "")
+          }
           check()
           props.onRefresh()
         }
@@ -85,6 +100,7 @@ export function PageCreate(props: { api: any; snap: any; onRefresh: () => void; 
         auto_sing: sing,
         inference_steps: 12,
         guidance_scale: 7.0,
+        lora,
       }, 60000)
       if (r && r.ok && r.job_id) {
         setJobId(String(r.job_id))
@@ -121,7 +137,44 @@ export function PageCreate(props: { api: any; snap: any; onRefresh: () => void; 
   }
 
   const ready = status && status.ok
+  const loras = (status && Array.isArray(status.loras)) ? status.loras : []
+
+  const startTrain = async () => {
+    if (trainBusy) return
+    if (!ready) { setNotice({ tone: "error", text: "ACE 环境还没就绪" }); return }
+    if (trainSource === "path" && !trainPath.trim()) {
+      setNotice({ tone: "error", text: "请先填素材目录的绝对路径" })
+      return
+    }
+    setTrainBusy("start")
+    setNotice(null)
+    setJob(null)
+    setJobId("")
+    try {
+      const r: any = await callEntry(api, "ms_ace_train", {
+        name: trainName.trim(),
+        source: trainSource,
+        path: trainPath.trim(),
+        caption: trainCaption.trim(),
+        lyrics: trainLyrics.trim(),
+        epochs: Number(trainEpochs) || 10,
+        rank: Number(trainRank) || 32,
+      }, 60000)
+      if (r && r.ok && r.job_id) {
+        setJobId(String(r.job_id))
+        setNotice({ tone: "info", text: "开始训练：" + (r.name || "") + "，素材 " + (r.samples || 0) + " 段" })
+      } else {
+        setTrainBusy("")
+        setNotice({ tone: "error", text: "没能开始训练：" + ((r && r.error) || "未知错误") })
+      }
+    } catch (e: any) {
+      setTrainBusy("")
+      setNotice({ tone: "error", text: String((e && e.message) || e) })
+    }
+  }
+
   const stateText = !job ? "" : job.state === "queued" ? "排队中" : job.state === "running" ? "生成中" : job.state === "done" ? "已完成" : job.state === "failed" ? "失败" : job.state
+  const isTrainJob = Boolean(job && job.job === "ace-train")
 
   return (
     <Col style={{ gap: 24 }}>
@@ -178,6 +231,12 @@ export function PageCreate(props: { api: any; snap: any; onRefresh: () => void; 
               </Row>
             </Field>
           </Grid>
+          <Field label="ACE 音色（LoRA；训练后可直接选）">
+            <Select value={lora} onChange={(e: any) => setLora(e.target.value)}>
+              <option value="">默认音色（不加载 LoRA）</option>
+              {loras.map((l: any) => <option key={l.name} value={l.name}>{l.name}</option>)}
+            </Select>
+          </Field>
           <Row style={{ flexWrap: "wrap", alignItems: "center", gap: 14 }}>
             <Muted>首次加载 ACE 模型会慢一些；同一时间只跑一个生成/唱的任务。</Muted>
           </Row>
@@ -191,13 +250,65 @@ export function PageCreate(props: { api: any; snap: any; onRefresh: () => void; 
         </Col>
       </Panel>
 
+      <FoldCard open={trainOpen} onToggle={() => setTrainOpen(!trainOpen)}
+                title="训练 ACE 音色（LoRA）"
+                sub={<Muted>让 ACE 直接唱出目标音色，而不是每次生成后再变声</Muted>}>
+        <Col style={{ gap: 14 }}>
+          <Muted>
+            素材默认取最近一次「训练声音」的切片，也可以选语料库清唱或自定义目录。
+            训练会长时间占用显卡，期间翻唱/生成会排队。
+          </Muted>
+          <Grid cols={2} min={220} gap={14}>
+            <Field label="音色名（留空自动命名）">
+              <Input value={trainName} placeholder="例如 梦梦pro" onChange={(e: any) => setTrainName(e.target.value)} />
+            </Field>
+            <Field label="素材来源">
+              <Select value={trainSource} onChange={(e: any) => setTrainSource(e.target.value)}>
+                <option value="latest_run">最近一次 DDSP 训练素材</option>
+                <option value="corpus">语料库清唱</option>
+                <option value="path">自定义目录</option>
+              </Select>
+            </Field>
+          </Grid>
+          {trainSource === "path" ? (
+            <Field label="素材目录（绝对路径）">
+              <Input value={trainPath} placeholder="例如 D:\\我的素材\\梦梦" onChange={(e: any) => setTrainPath(e.target.value)} />
+            </Field>
+          ) : null}
+          <Field label="风格描述（训练时的 caption）">
+            <Input value={trainCaption} onChange={(e: any) => setTrainCaption(e.target.value)} />
+          </Field>
+          <Field label="歌词（可选；留空用通用元音）">
+            <textarea style={TA_STYLE} rows={3} value={trainLyrics}
+                      placeholder="有歌词效果更好；没有就留空"
+                      onChange={(e: any) => setTrainLyrics(e.target.value)} />
+          </Field>
+          <Grid cols={2} min={220} gap={14}>
+            <Field label="训练轮数（1～100）">
+              <Input type="number" min={1} max={100} step={1} value={trainEpochs} onChange={(e: any) => setTrainEpochs(e.target.value)} />
+            </Field>
+            <Field label="LoRA rank（4～128，越大越吃显存）">
+              <Input type="number" min={4} max={128} step={4} value={trainRank} onChange={(e: any) => setTrainRank(e.target.value)} />
+            </Field>
+          </Grid>
+          <Row style={{ flexWrap: "wrap", alignItems: "center", gap: 12 }}>
+            <Btn style={PRIMARY_BTN} disabled={!ready || !!trainBusy || !!busy} onClick={startTrain}>
+              {trainBusy ? "正在训练…" : "开始训练"}
+            </Btn>
+            <Muted>首次训练约 10～40 分钟，取决于素材量和轮数；显卡显存占用约 6～10GB。</Muted>
+          </Row>
+        </Col>
+      </FoldCard>
+
       {job ? (
-        <Section title="生成进度" extra={<Muted>{stateText}</Muted>}>
+        <Section title={isTrainJob ? "训练进度" : "生成进度"} extra={<Muted>{stateText}</Muted>}>
           <Panel>
             <Col style={{ gap: 10 }}>
               <Row style={{ justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
                 <div style={{ fontSize: 14, fontWeight: 700, color: INK }}>
-                  {job.state === "done" ? "生成完成" : job.state === "failed" ? "生成失败" : "ACE-Step 正在生成"}
+                  {job.state === "done" ? (isTrainJob ? "训练完成" : "生成完成")
+                    : job.state === "failed" ? (isTrainJob ? "训练失败" : "生成失败")
+                    : (isTrainJob ? "ACE 音色训练中" : "ACE-Step 正在生成")}
                 </div>
                 <StatusBadge tone={job.state === "done" ? "success" : job.state === "failed" ? "error" : "warning"}>
                   {stateText}
@@ -209,7 +320,8 @@ export function PageCreate(props: { api: any; snap: any; onRefresh: () => void; 
               <Muted>{job.detail || job.message || "正在准备…"}</Muted>
               {job.state === "done" ? (
                 <Row style={{ flexWrap: "wrap", gap: 8 }}>
-                  <Btn style={PRIMARY_BTN} onClick={() => props.onGo("sing")}>去「让她唱歌」看看</Btn>
+                  {isTrainJob ? <Btn style={PRIMARY_BTN} onClick={check}>刷新音色列表</Btn> : null}
+                  <Btn style={isTrainJob ? undefined : PRIMARY_BTN} onClick={() => props.onGo("sing")}>去「让她唱歌」看看</Btn>
                   <Btn onClick={() => props.onGo("models")}>我的声音</Btn>
                 </Row>
               ) : null}

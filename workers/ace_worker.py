@@ -31,6 +31,14 @@ def main() -> int:
             sys.path.insert(0, str(pylibs))
         import ace_runtime  # noqa: E402
 
+        # 新版 transformers 下部分模块会用默认 float32 建临时张量，和 bf16
+        # 权重相乘会报 dtype mismatch；统一默认 dtype 为 bf16。
+        try:
+            import torch
+            torch.set_default_dtype(torch.bfloat16)
+        except Exception:
+            pass
+
         def maybe_float(value):
             try:
                 return float(value)
@@ -68,6 +76,7 @@ def main() -> int:
             offload_to_cpu=bool(job.get("offload_to_cpu", True)),
             offload_dit_to_cpu=bool(job.get("offload_dit_to_cpu", True)),
             output_dir=str(job["output_dir"]),
+            lora_path=str(job.get("lora_path") or "") or None,
         )
         generated = ace_runtime.generate_with_acestep_local(
             request, runtime_config, save_dir=str(job["output_dir"]))

@@ -142,22 +142,33 @@ def load_decoder_for_training(
 
     # Try attention implementations in preference order.
     # flash_attention_2 first (matches handler.initialize_service), then sdpa, then eager.
-    attn_candidates = []
-    if _is_flash_attention_available(device):
-        attn_candidates.append("flash_attention_2")
-    attn_candidates.extend(["sdpa", "eager"])
+    # The vendored ACE model only implements eager attention; sdpa loads but
+    # later fails with KeyError: 'sdpa' in the condition encoder.
+    attn_candidates = ["eager"]
 
     model = None
     last_err: Optional[Exception] = None
 
     for attn_impl in attn_candidates:
         try:
-            model = AutoModel.from_pretrained(
-                str(model_dir),
-                trust_remote_code=True,
-                attn_implementation=attn_impl,
-                dtype=dtype,
-            )
+            try:
+                model = AutoModel.from_pretrained(
+                    str(model_dir),
+                    trust_remote_code=True,
+                    attn_implementation=attn_impl,
+                    torch_dtype=dtype,
+                )
+            except TypeError as exc:
+                # transformers 4.x forwards attn_implementation into the
+                # remote model __init__; the vendored ACE model doesn't accept
+                # it. Retry without the kwarg (attention falls back to eager).
+                if "attn_implementation" not in str(exc):
+                    raise
+                model = AutoModel.from_pretrained(
+                    str(model_dir),
+                    trust_remote_code=True,
+                    torch_dtype=dtype,
+                )
             print(f"[OK] Model loaded with attn_implementation={attn_impl}")
             break
         except Exception as exc:
@@ -201,7 +212,10 @@ def load_preprocessing_models(
     The caller must call :func:`cleanup_preprocessing_models` when done.
     """
     from transformers import AutoModel, AutoTokenizer
-    from diffusers.models import AutoencoderOobleck
+    try:
+        from diffusers.models import AutoencoderOobleck
+    except Exception:
+        from acestep.compat_autoencoder_oobleck import AutoencoderOobleck
 
     ckpt = Path(checkpoint_dir)
     dtype = _resolve_dtype(precision)
@@ -274,7 +288,12 @@ def load_vae(
     Returns the VAE model in eval mode, or raises ``FileNotFoundError``
     if the ``vae/`` directory is missing.
     """
-    from diffusers.models import AutoencoderOobleck
+    try:
+        from diffusers.models import AutoencoderOobleck
+    except Exception:
+        # pylibs 里的 huggingface_hub 为兼容 transformers 4.28 而较旧，
+        # diffusers 新版导入会失败；用 vendored 的等价实现。
+        from acestep.compat_autoencoder_oobleck import AutoencoderOobleck
 
     vae_path = Path(checkpoint_dir) / "vae"
     if not vae_path.is_dir():

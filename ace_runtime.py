@@ -24,6 +24,7 @@ class AceStepRuntimeConfig:
     prefer_source: Optional[str] = None
     use_mlx_dit: bool = True
     output_dir: str = DEFAULT_OUTPUT_DIR
+    lora_path: Optional[str] = None
 
 
 @dataclass
@@ -117,6 +118,8 @@ class AceStepLocalRuntime:
             if not ok:
                 raise RuntimeError(status)
 
+            if self.config.lora_path:
+                dit_handler.load_lora(self.config.lora_path)
             self._dit_handler = dit_handler
             self._active_model = target_model
 
