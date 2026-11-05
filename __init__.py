@@ -182,6 +182,8 @@ class MusicSynthPlugin(NekoPluginBase):
         # 录音停止标记：job_id -> 标记文件路径（「录到我说停」用）
         # 旧语料没有 dur_s：启动后台补测一次（ffprobe 只读文件头，很快）
         self._thread("corpus-dur-backfill", self._corpus_backfill_durations)
+        # 先清掉「文件和切片都已经不在了」的失效记录，避免一直显示、又删不掉
+        self._thread("corpus-drop-missing", self._corpus_drop_missing_sources)
         # 上次被中断的素材（status=processing）重新排队，接着处理
         self._thread("corpus-resume", self._corpus_resume_pending)
         # The host's [music_synth] section seeds first-run defaults; anything
@@ -2710,6 +2712,34 @@ class MusicSynthPlugin(NekoPluginBase):
             except Exception:  # noqa: BLE001
                 pass
 
+    def _corpus_drop_missing_sources(self) -> None:
+        """Remove index entries whose original files and clips are all gone."""
+        try:
+            with self._corpus_lock:
+                index = self._corpus_index()
+                keep, dropped = [], []
+                for src in index.get("sources", []):
+                    files = [f for f in src.get("files", []) if isinstance(f, dict)
+                             and Path(str(f.get("path") or "")).is_file()]
+                    clips = [c for c in src.get("clips", []) if isinstance(c, dict)
+                             and c.get("path") and Path(str(c["path"])).is_file()]
+                    if not files and not clips:
+                        dropped.append(str(src.get("id") or ""))
+                        continue
+                    keep.append(src)
+                if dropped:
+                    index["sources"] = keep
+                    self._corpus_write_index(index)
+                    try:
+                        self.logger.info("清理失效素材记录：%s", dropped[:10])
+                    except Exception:  # noqa: BLE001
+                        pass
+        except Exception as exc:  # noqa: BLE001
+            try:
+                self.logger.warning("清理失效素材记录失败：%s", exc)
+            except Exception:  # noqa: BLE001
+                pass
+
     def _corpus_resume_pending(self) -> None:
         """插件重启后，把上次没跑完（status=queued/processing）的素材重新排队。"""
         try:
@@ -3573,11 +3603,13 @@ class MusicSynthPlugin(NekoPluginBase):
         for src in targets:
             sid = str(src.get("id") or "")
             src_moved, src_errors = 0, []
+            src_seen = 0
             preview_keys = []
             for f in src.get("files", []):
                 p = Path(str(f.get("path") or ""))
                 if not p.is_file():
                     continue
+                src_seen += 1
                 try:
                     preview_keys.append(self._preview_key(p))
                 except OSError:
@@ -3588,12 +3620,15 @@ class MusicSynthPlugin(NekoPluginBase):
                 else:
                     src_errors.append(r)
             for c in src.get("clips", []):
-                if c.get("path"):
-                    r = self._trash_move(Path(str(c["path"])), hash_file=False)
-                    if r.get("moved"):
-                        src_moved += 1
-                    else:
-                        src_errors.append(r)
+                cp = Path(str(c.get("path") or ""))
+                if not cp.is_file():
+                    continue
+                src_seen += 1
+                r = self._trash_move(cp, hash_file=False)
+                if r.get("moved"):
+                    src_moved += 1
+                else:
+                    src_errors.append(r)
             # 试听缓存是硬链接，源文件进回收站后一起清掉
             try:
                 cache = self._plugin_dir / "static" / "_preview"
@@ -3605,7 +3640,9 @@ class MusicSynthPlugin(NekoPluginBase):
                             pass
             except OSError:
                 pass
-            if src_moved:
+            if src_moved or src_seen == 0:
+                # 有文件搬走，或者文件/切片本来就已经全不在了（失效记录）：
+                # 都从索引里摘掉，避免它一直挂在列表里删不掉。
                 removed.append(sid)
                 moved_total += src_moved
             if src_errors:
