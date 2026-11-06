@@ -24,3 +24,14 @@ dist/
 # 运行时缓存
 .cache/
 *.egg-info/
+
+# 市场 CLI 要求的忽略项
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+store.db
+.env
+.DS_Store
+build/

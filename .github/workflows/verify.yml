@@ -1,8 +1,7 @@
-name: Verify plugin
+name: Verify N.E.K.O Plugin
 
 on:
   push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -14,5 +13,5 @@ jobs:
     uses: Project-N-E-K-O/N.E.K.O/.github/workflows/plugin-market-verify.yml@main
     with:
       plugin-id: music_synth
-      plugin-directory: ''
+      neko-repository: Project-N-E-K-O/N.E.K.O
       neko-ref: main
