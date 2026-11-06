@@ -23,8 +23,8 @@ def main() -> int:
     out_path = Path(sys.argv[2])
     result: dict = {"ok": False, "step": "f0_probe"}
     try:
-        import numpy as np
         import librosa
+        import numpy as np
 
         src = Path(job["input"]).resolve()
         if not src.is_file():

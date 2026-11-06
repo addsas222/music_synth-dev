@@ -160,8 +160,10 @@ def _music_session(job: dict, smtc: dict) -> dict | None:
 def main() -> int:
     job = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
     out_path = Path(sys.argv[2])
-    out_dir = Path(job["out_dir"]); out_dir.mkdir(parents=True, exist_ok=True)
-    events_path = Path(job["events_path"]); events_path.parent.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(job["out_dir"])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    events_path = Path(job["events_path"])
+    events_path.parent.mkdir(parents=True, exist_ok=True)
     status_path = Path(job["status_path"])
     stop_path = Path(str(job["stop_path"])) if job.get("stop_path") else None
     capture = Capture(job)

@@ -29,14 +29,13 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import time
 import traceback
 from datetime import datetime
-from typing import Callable
 from pathlib import Path
+from typing import Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from base_ckpt import normalize_checkpoint  # noqa: E402
@@ -381,7 +380,7 @@ def _free_vram(python: Path) -> float | None:
     if code != 0:
         return None
     try:
-        return float([l for l in tail if l.strip()][-1])
+        return float([line for line in tail if line.strip()][-1])
     except (ValueError, IndexError):
         return None
 
@@ -646,7 +645,7 @@ def _run_preview(state: dict, ckpt: Path, preview_src: str, python: Path,
            "-fmin", "65", "-fmax", "800", "-th", "-60"]
     code, tail, _ = _run(cmd, repo, repo, log_path, timeout=None)
     if code != 0 or not wav_out.is_file():
-        log(f"预听推理失败：\n" + "\n".join(tail[-20:]))
+        log("预听推理失败：\n" + "\n".join(tail[-20:]))
         return base
 
     seconds = peak = rms = 0.0

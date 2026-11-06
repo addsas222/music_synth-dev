@@ -285,11 +285,10 @@ def _separate_audio_separator(job: dict) -> dict:
 
 
 def _separate_demucs(job: dict) -> dict:
-    import torch  # type: ignore
-    from demucs.pretrained import get_model  # type: ignore
-    from demucs.apply import apply_model  # type: ignore
     import soundfile as sf
-    import numpy as np
+    import torch  # type: ignore
+    from demucs.apply import apply_model  # type: ignore
+    from demucs.pretrained import get_model  # type: ignore
 
     out_dir = Path(job["out_dir"]).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)

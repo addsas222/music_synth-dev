@@ -47,8 +47,8 @@ def _audio_files(root: Path) -> list[Path]:
 
 def _auto_caption(files: list[Path]) -> tuple[str, str]:
     """Listen to a few clips and describe the voice in English (for ACE) + Chinese (UI)."""
-    import numpy as np
     import librosa
+    import numpy as np
 
     f0s, cents = [], []
     for p in files[:6]:
@@ -102,6 +102,7 @@ def main() -> int:
         project_root = Path(job["project_root"]).resolve()
         pylibs = Path(job["pylibs"]).resolve()
         sys.path.insert(0, str(plugin_dir))
+        sys.path.insert(0, str(plugin_dir / "vendor"))
         sys.path.insert(0, str(pylibs))
 
         import torch

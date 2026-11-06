@@ -6,7 +6,6 @@ No native calls at import. No host SDK or external package dependencies.
 """
 from __future__ import annotations
 
-import os
 import re
 import sys
 from dataclasses import dataclass
@@ -131,7 +130,8 @@ def identify_host_tree(processes, *, known_hosts=NEKO_HOST_EXECUTABLES,
                         ai.add(pid)
                 except (ValueError,KeyError,TypeError):
                     continue
-        if len(ai)==old:break
+        if len(ai) == old:
+            break
     return ai,roots
 
 
@@ -258,7 +258,8 @@ def process_image_path(pid: int) -> str:
         k.CloseHandle.argtypes=[w.HANDLE]
         k.CloseHandle.restype=w.BOOL
         h=k.OpenProcess(0x1000,False,int(pid))
-        if not h:return ''
+        if not h:
+            return ''
         try:
             name=ct.create_unicode_buffer(32768)
             size=w.DWORD(len(name))
@@ -319,10 +320,12 @@ def list_app_processes(*, limit: int = 200, pid_allowlist: Optional[set[int]]=No
     if exact_name and allow is None:
         parents={pid:parent for pid,_,parent in candidates}
         for pid,name,_ in candidates:
-            if name.casefold()!=exact_name:continue
+            if name.casefold() != exact_name:
+                continue
             cursor=pid
             for _ in range(12):
-                if cursor<=4 or cursor in relevant:break
+                if cursor <= 4 or cursor in relevant:
+                    break
                 relevant.add(cursor)
                 cursor=parents.get(cursor,0)
     all_infos=[]
@@ -345,21 +348,28 @@ def list_app_processes(*, limit: int = 200, pid_allowlist: Optional[set[int]]=No
         for pid in allow:
             node=by_pid.get(pid)
             for _ in range(12):
-                if not node:break
+                if not node:
+                    break
                 parent=by_pid.get(node['parent_pid'])
-                if not parent or parent['pid']==pid:break
-                if not parent['created']:parent['created']=process_start_token(parent['pid'])
+                if not parent or parent['pid'] == pid:
+                    break
+                if not parent['created']:
+                    parent['created'] = process_start_token(parent['pid'])
                 node=parent
     ai,roots=identify_host_tree(all_infos,host_exe_path=host_exe_path)
     result=[]
     for item in sorted(all_infos,key=lambda x:(x['name'].casefold(),x['pid'])):
         pid=item['pid']
-        if allow is not None and pid not in allow:continue
-        if exact_name and item['name'].casefold()!=exact_name:continue
-        if not item['created']:continue
+        if allow is not None and pid not in allow:
+            continue
+        if exact_name and item['name'].casefold() != exact_name:
+            continue
+        if not item['created']:
+            continue
         result.append(AppIdentity(pid,item['created'],item['name'],
                                   item['parent_pid'],pid in ai,item.get('path','')).as_dict())
-        if len(result)>=max(1,min(500,int(limit))):break
+        if len(result) >= max(1, min(500, int(limit))):
+            break
     return result
 
 

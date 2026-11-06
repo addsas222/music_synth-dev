@@ -955,17 +955,22 @@ class MetadataConstrainedLogitsProcessor(LogitsProcessor):
         Load genres vocabulary from file. Supports hot reload by checking file mtime.
         File format: one genre per line, lines starting with # are comments.
         """
-        if not os.path.exists(self.genres_vocab_path):
+        path = self.genres_vocab_path
+        if not os.path.exists(path) and os.path.exists(path + ".gz"):
+            path = path + ".gz"
+        if not os.path.exists(path):
             if self.debug:
                 logger.debug(f"Genres vocab file not found: {self.genres_vocab_path}")
             return
-        
+
         try:
-            mtime = os.path.getmtime(self.genres_vocab_path)
+            mtime = os.path.getmtime(path)
             if mtime <= self.genres_vocab_mtime:
                 return  # File hasn't changed
-            
-            with open(self.genres_vocab_path, 'r', encoding='utf-8') as f:
+
+            import gzip
+            opener = gzip.open if path.endswith(".gz") else open
+            with opener(path, 'rt', encoding='utf-8') as f:
                 genres = []
                 for line in f:
                     line = line.strip()

@@ -75,9 +75,9 @@ def main() -> int:
     out_path = Path(sys.argv[2])
     result = {"ok": False, "step": "mix"}
     try:
+        import librosa
         import numpy as np
         import soundfile as sf
-        import librosa
 
         vocal_path = Path(job["vocal"]).resolve()
         inst_path = Path(job["instrumental"]).resolve()
@@ -131,7 +131,8 @@ def main() -> int:
                     ref_mono = librosa.resample(ref_mono, orig_sr=int(ref_sr), target_sr=int(ir))
                 n_ref = min(len(ref_mono), len(vocal_mono))
                 if n_ref > 0:
-                    from scipy.signal import butter as _butter, sosfiltfilt as _sos
+                    from scipy.signal import butter as _butter
+                    from scipy.signal import sosfiltfilt as _sos
                     sos = _butter(4, 3800 / (ir / 2), btype="highpass", output="sos")
                     ref_hf = _sos(sos, ref_mono[:n_ref]).astype(np.float32)
                     env = librosa.feature.rms(y=ref_hf, frame_length=1024, hop_length=256)[0]

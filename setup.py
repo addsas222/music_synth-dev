@@ -290,7 +290,6 @@ def _download_file(url: str, target: Path, progress, label: str,
                     fh.write(chunk)
                     done += len(chunk)
                     if progress and total:
-                        pct = min(99.0, done * 100.0 / total)
                         progress(f"{label}：{done / 2**20:.0f}/{total / 2**20:.0f} MB")
                         if expected_bytes:
                             pass
@@ -829,7 +828,6 @@ def install(paths: dict, items: list[str] | None, progress, probe: dict | None =
                 "errors": [{"item": "install_path",
                             "error": "请先选择安装位置（绝对路径）"}],
                 "missing_after": report.get("missing", []), "report": report}
-    by_key = _item_map(report)
     requested = items or [i["key"] for i in report["items"]
                           if i["installable"] and i["status"] != "ready"]
     installed: list[str] = []

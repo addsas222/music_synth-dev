@@ -17,8 +17,8 @@ Payload hash:
 import hashlib
 import json
 import os
-import re
 import sys
+
 try:
     import tomllib
 except ModuleNotFoundError:  # Python 3.10 (build host may be older than the plugin runtime)

@@ -45,9 +45,8 @@ def main() -> int:
 
         import soundfile as sf
         import torch
-        from omegaconf import OmegaConf
-
         from cli.inference_svc import build_model
+        from omegaconf import OmegaConf
         from preprocess.tools.f0_extraction import F0Extractor
 
         device = str(job.get("device") or "cuda")

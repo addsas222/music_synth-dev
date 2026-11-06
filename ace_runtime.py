@@ -6,7 +6,6 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
-
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DEFAULT_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "generated_songs", "acestep_local")
 
@@ -267,6 +266,13 @@ class AceStepLocalRuntime:
         )
 
     def _import_runtime(self) -> Dict[str, Any]:
+        # Vendored ACE-Step code lives under ./vendor so the Market's Ruff gate
+        # (which excludes vendor/) does not lint third-party code.
+        import sys
+        from pathlib import Path
+        vendor = Path(__file__).resolve().parent / "vendor"
+        if vendor.is_dir() and str(vendor) not in sys.path:
+            sys.path.insert(0, str(vendor))
         try:
             handler_module = importlib.import_module("acestep.handler")
             inference_module = importlib.import_module("acestep.inference")

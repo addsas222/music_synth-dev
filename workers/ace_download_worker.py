@@ -37,9 +37,12 @@ def main() -> int:
     result = {"ok": False, "step": "ace_download"}
     try:
         sys.path.insert(0, str(job["plugin_dir"]))
+        sys.path.insert(0, str(Path(str(job["plugin_dir"])) / "vendor"))
         sys.path.insert(0, str(job["pylibs"]))
         from acestep.model_downloader import (
-            SUBMODEL_REGISTRY, _sync_model_code_files, download_submodel,
+            SUBMODEL_REGISTRY,
+            _sync_model_code_files,
+            download_submodel,
         )
 
         name = str(job.get("model") or "").strip()

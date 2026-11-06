@@ -26,6 +26,8 @@ def main() -> int:
     try:
         plugin_dir = Path(job["plugin_dir"]).resolve()
         sys.path.insert(0, str(plugin_dir))
+        # ACE-Step 是 vendored 第三方代码，放在 vendor/ 下（Market 的 Ruff 会跳过）。
+        sys.path.insert(0, str(plugin_dir / "vendor"))
         pylibs = Path(str(job.get("pylibs") or ""))
         if str(pylibs) and pylibs.is_dir():
             sys.path.insert(0, str(pylibs))
@@ -97,9 +99,9 @@ def main() -> int:
         # 分数只是「自动挑一个」，其余候选仍会回到面板里给用户试听。
         best, scores = 0, []
         try:
+            import librosa
             import numpy as np
             import soundfile as sf
-            import librosa
 
             vals = []
             for audio_path in audios:

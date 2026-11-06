@@ -1145,14 +1145,22 @@ _PROC_TAP_NAME = "proc-tap-1.1.1-4a0fbb7d05"
 
 def _plugin_asset_addon():
     """proc-tap addon shipped inside the plugin package (no download needed)."""
-    candidate = Path(__file__).resolve().parent / "assets" / _PROC_TAP_NAME
-    return candidate if (candidate / "proctap").is_dir() else None
+    root = Path(__file__).resolve().parent
+    for base in (root / "vendor", root / "assets"):
+        candidate = base / _PROC_TAP_NAME
+        if (candidate / "proctap").is_dir():
+            return candidate
+    return None
 
 
 def _plugin_asset_smtc_vendor():
     """winrt (+typing_extensions) shipped for reading Windows media sessions."""
-    candidate = Path(__file__).resolve().parent / "assets" / "smtc_vendor"
-    return candidate if (candidate / "winrt").is_dir() else None
+    root = Path(__file__).resolve().parent
+    for base in (root / "vendor", root / "assets"):
+        candidate = base / "smtc_vendor"
+        if (candidate / "winrt").is_dir():
+            return candidate
+    return None
 
 
 def _venv_site_packages(python) -> Path | None:
@@ -1222,6 +1230,36 @@ def locate_app_capture_runtime(data_dir: Path, synth_python: str = "") -> dict:
     return {"ok": False,
             "error": "逐应用声道采集组件缺失（合成环境 numpy 或 proc-tap）",
             "hint": "先完成一次合成环境安装；本插件已内置 proc-tap，不需要另装为她所听。"}
+
+
+def _link_or_copy_tree(src: Path, dst: Path) -> int:
+    """Mirror a directory tree, hard-linking files when the volume allows.
+
+    Returns the number of files created. Existing destinations are replaced so a
+    partial copy from an interrupted install can be healed on the next run.
+    """
+    src = Path(src)
+    dst = Path(dst)
+    if not src.is_dir():
+        raise FileNotFoundError(str(src))
+    count = 0
+    for item in src.rglob("*"):
+        target = dst / item.relative_to(src)
+        if item.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            try:
+                target.unlink()
+            except OSError:
+                pass
+        try:
+            os.link(item, target)
+        except OSError:
+            shutil.copy2(item, target)
+        count += 1
+    return count
 
 
 def copy_app_capture_runtime(data_dir: Path) -> dict:

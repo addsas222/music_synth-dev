@@ -8,13 +8,13 @@ Protocol matches isolated_loopback.py: READY R; optional 48kHz stereo H;
 2-second float32 16kHz mono D; bounded UTF-8 error E. Audio stays in RAM.
 """
 from __future__ import annotations
+
 import json
-import os
-from pathlib import Path
 import struct
 import sys
 import time
 import traceback
+from pathlib import Path
 
 _HEADER = struct.Struct('!cI')
 _OUT = sys.stdout.buffer
@@ -34,9 +34,9 @@ def _message(tag, info):
 
 
 def _stream(tap, source, token, *, stereo: bool):
+    import app_channels
     import numpy as np
     from scipy.signal import resample_poly
-    import app_channels
 
     pending = bytearray()
     framesize = 2 * 4   # 48kHz stereo interleaved float32 (ProcTap API)
@@ -84,8 +84,10 @@ def _stream(tap, source, token, *, stereo: bool):
 def main():
     stage = 'initializing_process_capture'
     try:
-        try: sys.stderr.reconfigure(encoding='utf-8', errors='replace')
-        except (AttributeError, ValueError, OSError): pass
+        try:
+            sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+        except (AttributeError, ValueError, OSError):
+            pass
         if sys.platform != 'win32':
             raise RuntimeError('Windows_10_20348_or_later_required')
         if len(sys.argv) not in (5, 6):
@@ -121,7 +123,8 @@ def main():
         traceback.print_exc(limit=7, file=sys.stderr)
         try:
             _message(b'E',{'stage':stage,'error':str(exc)[:340]})
-        except (OSError,BrokenPipeError):pass
+        except (OSError, BrokenPipeError):
+            pass
         return 1
     return 0
 

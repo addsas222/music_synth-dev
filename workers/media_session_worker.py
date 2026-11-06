@@ -3,10 +3,11 @@
 No audio is captured here. Bytes-only JSON avoids Windows GBK stdout failures.
 """
 from __future__ import annotations
+
 import asyncio
 import json
-from pathlib import Path
 import sys
+from pathlib import Path
 
 
 def _to_seconds(value):

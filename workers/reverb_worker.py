@@ -24,8 +24,8 @@ _WET_MAX = 0.50
 
 
 def _cpp(samples, rate):
-    import numpy as np
     import librosa
+    import numpy as np
 
     n_fft = 1024
     hop = 256
