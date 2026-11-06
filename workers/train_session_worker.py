@@ -193,6 +193,23 @@ def _read_ckpt_steps(expdir: Path) -> list[int]:
                   if (m := re.search(r"model_(\d+)\.pt$", p.name)))
 
 
+def _is_oom_text(lines) -> bool:
+    """True when a training/preprocess log tail looks like a GPU OOM."""
+    text = "\n".join(str(x) for x in (lines or [])).lower()
+    return any(key in text for key in (
+        "out of memory", "allocation failed", "not enough memory",
+        "cuda error", "cublas_status_alloc_failed", "oom",
+    ))
+
+
+def _train_device(state: dict, params: dict | None = None) -> str:
+    value = str(state.get("device")
+                or (params or {}).get("device")
+                or (state.get("params") or {}).get("device")
+                or "cuda")
+    return "cpu" if value.strip().lower() == "cpu" else "cuda"
+
+
 def _parse_val_loss(tail: list[str]) -> float | None:
     """从训练日志解析最近一次 validation loss。
 
@@ -489,9 +506,20 @@ def _auto_params(state: dict, job: dict, python: Path) -> dict:
     lr = 0.0001
     lr_reason = "从固定起点起步 → lr=1e-4"
 
+    # 训练设备：显存不足/读不到显存时自动退回 CPU；CPU 只能用 fp32、batch=1。
+    free_vram_now = _free_vram(python)
+    device = "cuda"
+    if free_vram_now is None or free_vram_now < 2.5:
+        device = "cpu"
+        batch = 1
+        amp = "fp32"
+        reason = ("空闲显存不足或不可用：自动改用 CPU 训练"
+                  "（batch=1、fp32，速度会慢很多）")
+
     return {
         "batch_size": batch, "accum_steps": accum_steps,
         "duration": duration, "lr": lr, "amp": amp,
+        "device": device,
         "preview_step": preview_step, "use_pitch_aug": use_pitch_aug,
         "cache_fp16": cache_fp16,
         "init_from": init_from, "milestones": milestones,
@@ -546,6 +574,12 @@ def _build_config(state: dict, params: dict, run_dir: Path, repo: Path) -> Path:
                 mcfg[key] = int(arch[key])
         mcfg["use_pitch_aug"] = bool(arch.get("use_pitch_aug", True))
         mcfg["n_spk"] = int(arch.get("n_spk") or 1)
+    # 训练设备跟随自动定参/降级结果；CPU 时强制 fp32。
+    train_device = str(state.get("device") or params.get("device") or "cuda")
+    cfg["device"] = train_device
+    if train_device == "cpu":
+        cfg["train"]["amp_dtype"] = "fp32"
+        cfg["train"]["cache_device"] = "cpu"
     cfg["data"]["train_path"] = str(run_dir / "data" / "train")
     cfg["data"]["valid_path"] = str(run_dir / "data" / "val")
     cfg["data"]["duration"] = float(params["duration"])
@@ -603,9 +637,12 @@ def _build_config(state: dict, params: dict, run_dir: Path, repo: Path) -> Path:
 def _run_preprocess(state: dict, params: dict, run_dir: Path, python: Path,
                     repo: Path, log_path: Path, log) -> None:
     cfg_path = _build_config(state, params, run_dir, repo)
-    log(f"运行 preprocess（train={run_dir / 'data' / 'train'}）")
+    dev = _train_device(state, params)
+    dtype = "fp32" if dev == "cpu" else "fp16"
+    log(f"运行 preprocess（train={run_dir / 'data' / 'train'}，设备 {dev}）")
     code, tail, _ = _run([str(python), "-X", "utf8", str(repo / "preprocess.py"),
-                          "-c", str(cfg_path), "-d", "cuda", "-j", "2", "--store_dtype", "fp16"],
+                          "-c", str(cfg_path), "-d", dev, "-j", "2",
+                          "--store_dtype", dtype],
                           repo, repo, log_path, timeout=None)
     if code != 0:
         raise RuntimeError("preprocess 失败：\n" + "\n".join(tail[-40:]))
@@ -639,11 +676,20 @@ def _run_preview(state: dict, ckpt: Path, preview_src: str, python: Path,
     except (TypeError, ValueError):
         preview_step = 120
     preview_step = max(5, min(400, preview_step))
-    cmd = [str(python), "-X", "utf8", str(repo / "main_reflow.py"),
-           "-m", str(ckpt), "-i", str(src), "-o", str(wav_out),
-           "-k", "0", "-step", str(preview_step), "-pe", "rmvpe", "-d", "cuda",
-           "-fmin", "65", "-fmax", "800", "-th", "-60"]
-    code, tail, _ = _run(cmd, repo, repo, log_path, timeout=None)
+    dev = _train_device(state)
+
+    def _preview_cmd(device: str) -> list[str]:
+        return [str(python), "-X", "utf8", str(repo / "main_reflow.py"),
+                "-m", str(ckpt), "-i", str(src), "-o", str(wav_out),
+                "-k", "0", "-step", str(preview_step), "-pe", "rmvpe",
+                "-d", device, "-fmin", "65", "-fmax", "800", "-th", "-60"]
+
+    code, tail, _ = _run(_preview_cmd(dev), repo, repo, log_path, timeout=None)
+    if (code != 0 or not wav_out.is_file()) and dev != "cpu" \
+            and _is_oom_text(tail):
+        log("预听推理显存不足，改用 CPU 重试")
+        code, tail, _ = _run(_preview_cmd("cpu"), repo, repo, log_path,
+                             timeout=None)
     if code != 0 or not wav_out.is_file():
         log("预听推理失败：\n" + "\n".join(tail[-20:]))
         return base
@@ -1086,7 +1132,6 @@ def main() -> int:
                 state["live"] = {"step": 0, "base_step": cur_step, "batch": 0,
                                  "batch_per_s": None, "updated_at": ""}
                 save_state()
-                cfg_path = _build_config(state, state.get("params", {}), run_dir, repo)
 
                 def _check_stop() -> bool:
                     if stop_hit["v"]:
@@ -1098,10 +1143,34 @@ def main() -> int:
                     stop_hit["v"] = True
                     return True
 
-                code, tail, elapsed = _run([str(python), "-X", "utf8",
-                                            str(repo / "train_reflow.py"), "-c", str(cfg_path)],
-                                           repo, repo, log_path, timeout=None, on_line=on_line,
-                                           stop_check=_check_stop)
+                params_now = state.get("params", {})
+                attempts = 0
+                while True:
+                    cfg_path = _build_config(state, params_now, run_dir, repo)
+                    code, tail, elapsed = _run(
+                        [str(python), "-X", "utf8",
+                         str(repo / "train_reflow.py"), "-c", str(cfg_path)],
+                        repo, repo, log_path, timeout=None,
+                        on_line=on_line, stop_check=_check_stop)
+                    if stop_hit["v"] or code == 0 or attempts >= 3 \
+                            or not _is_oom_text(tail):
+                        break
+                    attempts += 1
+                    if int(params_now.get("batch_size") or 1) > 1:
+                        params_now["batch_size"] = max(
+                            1, int(params_now["batch_size"]) // 2)
+                        state["params"] = params_now
+                        log(f"训练显存不足：batch_size 降到 "
+                            f"{params_now['batch_size']} 重试")
+                    elif _train_device(state, params_now) != "cpu":
+                        state["device"] = "cpu"
+                        params_now["device"] = "cpu"
+                        params_now["amp"] = "fp32"
+                        log("训练显存不足且 batch 已为 1：改用 CPU 训练"
+                            "（会非常慢）")
+                    else:
+                        break
+                    save_state()
             elapsed = max(elapsed, 1e-6)
             if stop_hit["v"]:
                 state["phase"] = "stopping"

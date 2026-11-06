@@ -5179,15 +5179,28 @@ class MusicSynthPlugin(NekoPluginBase):
             with self._process_lock:
                 self._job_update(job_id, state="running", progress=5,
                                  detail="正在加载 ACE-Step 并生成（首次较慢，请耐心等）")
-                try:
-                    result = runtime.run_worker(
-                        p["python"], self._train_worker("ace_worker.py"),
-                        job, cwd=p["output"], timeout=3600,
-                        log_path=self._pipeline.log_path)
-                except Exception as exc:  # noqa: BLE001
-                    self._job_update(job_id, state="failed", progress=100,
-                                     detail=f"{type(exc).__name__}: {exc}")
-                    return
+                attempts = [job]
+                if str(job.get("device") or "auto").strip().lower() != "cpu":
+                    cpu_job = dict(job)
+                    cpu_job.update({"device": "cpu", "offload_to_cpu": True,
+                                    "offload_dit_to_cpu": False})
+                    attempts.append(cpu_job)
+                result = None
+                for index, attempt in enumerate(attempts, 1):
+                    try:
+                        result = runtime.run_worker(
+                            p["python"], self._train_worker("ace_worker.py"),
+                            attempt, cwd=p["output"], timeout=3600,
+                            log_path=self._pipeline.log_path)
+                    except Exception as exc:  # noqa: BLE001
+                        result = {"ok": False,
+                                  "error": f"{type(exc).__name__}: {exc}"}
+                    if result.get("ok") or index == len(attempts) \
+                            or not runtime.is_oom(result):
+                        break
+                    self._job_update(
+                        job_id, progress=5,
+                        detail="显存不足，自动改用 CPU 重新生成（速度会慢很多）…")
                 if not result.get("ok") or not result.get("wav"):
                     self._job_update(job_id, state="failed", progress=100,
                                      detail=str(result.get("error") or "ACE 生成失败"))
@@ -5425,12 +5438,23 @@ class MusicSynthPlugin(NekoPluginBase):
             if not self._process_lock.acquire(blocking=False):
                 return Ok({"ok": False,
                            "error": "正在训练或生成，等它结束再试听"})
+            attempts = [job]
+            if str(job.get("device") or "auto").strip().lower() != "cpu":
+                cpu_job = dict(job)
+                cpu_job.update({"device": "cpu", "offload_to_cpu": True,
+                                "offload_dit_to_cpu": False})
+                attempts.append(cpu_job)
+            result = None
             try:
-                result = await asyncio.to_thread(
-                    lambda: runtime.run_worker(
+                for index, attempt in enumerate(attempts, 1):
+                    result = await asyncio.to_thread(
+                        runtime.run_worker,
                         p["python"], self._train_worker("ace_worker.py"),
-                        job, cwd=out_dir, timeout=1800,
-                        log_path=self._pipeline.log_path))
+                        attempt, cwd=out_dir, timeout=1800,
+                        log_path=self._pipeline.log_path)
+                    if result.get("ok") or index == len(attempts) \
+                            or not runtime.is_oom(result):
+                        break
             finally:
                 self._process_lock.release()
             if not result.get("ok") or not result.get("wav"):
@@ -5534,6 +5558,8 @@ class MusicSynthPlugin(NekoPluginBase):
             "max_duration": max(5.0, min(240.0, float(max_duration or 60.0))),
             "device": "cuda",
             "precision": "bf16",
+            # 显存吃紧时把编码器/VAE 挪到内存，给 DiT 让出 2-4GB。
+            "offload_encoder": True,
         }
 
         def lora_name_for(model_name: str, many: bool) -> str:
@@ -5556,14 +5582,30 @@ class MusicSynthPlugin(NekoPluginBase):
                         detail=f"排队训练 {index}/{total}：{model_name} → 「{lora_name}」")
                     job = dict(job_base, name=lora_name,
                                model_name=model_name, model_alias=alias)
-                    try:
-                        result = runtime.run_worker(
-                            p["python"], self._train_worker("ace_train_worker.py"),
-                            job, cwd=p["output"], timeout=21600,
-                            log_path=self._pipeline.log_path)
-                    except Exception as exc:  # noqa: BLE001
-                        errors.append(f"{model_name}：{type(exc).__name__}: {exc}")
-                        continue
+                    attempts = [job]
+                    if str(job.get("device") or "cuda").startswith("cuda"):
+                        cpu_job = dict(job)
+                        cpu_job.update({"device": "cpu", "precision": "fp32",
+                                        "batch": 1})
+                        attempts.append(cpu_job)
+                    result = None
+                    for attempt_index, attempt in enumerate(attempts, 1):
+                        try:
+                            result = runtime.run_worker(
+                                p["python"],
+                                self._train_worker("ace_train_worker.py"),
+                                attempt, cwd=p["output"], timeout=21600,
+                                log_path=self._pipeline.log_path)
+                        except Exception as exc:  # noqa: BLE001
+                            result = {"ok": False,
+                                      "error": f"{type(exc).__name__}: {exc}"}
+                        if result.get("ok") or attempt_index == len(attempts) \
+                                or not runtime.is_oom(result):
+                            break
+                        self._job_update(
+                            job_id,
+                            detail=(f"{model_name}：显存不足，"
+                                    "改用 CPU 训练（会非常慢）…"))
                     if not result.get("ok"):
                         errors.append(f"{model_name}：{result.get('error') or '训练失败'}")
                         continue

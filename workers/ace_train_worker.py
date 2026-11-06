@@ -195,6 +195,8 @@ def main() -> int:
             "--num-workers", "0",
             "--rank", str(max(4, min(128, int(job.get("rank") or 32)))),
             "--alpha", str(max(4, min(256, int(job.get("alpha") or 64)))),
+            ("--offload-encoder" if bool(job.get("offload_encoder", True))
+             else "--no-offload-encoder"),
             "--save-every", str(epochs),
         ])
         rc = run_fixed(args)

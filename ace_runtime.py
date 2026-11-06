@@ -266,13 +266,15 @@ class AceStepLocalRuntime:
         )
 
     def _import_runtime(self) -> Dict[str, Any]:
-        # Vendored ACE-Step code lives under ./vendor so the Market's Ruff gate
-        # (which excludes vendor/) does not lint third-party code.
+        # Vendored ACE-Step code lives under ./vendor (Market Ruff excludes it).
+        # Older installs kept it at the plugin root; keep both on sys.path so an
+        # in-place upgrade of an existing installation still works.
         import sys
         from pathlib import Path
-        vendor = Path(__file__).resolve().parent / "vendor"
-        if vendor.is_dir() and str(vendor) not in sys.path:
-            sys.path.insert(0, str(vendor))
+        root = Path(__file__).resolve().parent
+        for candidate in (root / "vendor", root):
+            if candidate.is_dir() and str(candidate) not in sys.path:
+                sys.path.insert(0, str(candidate))
         try:
             handler_module = importlib.import_module("acestep.handler")
             inference_module = importlib.import_module("acestep.inference")

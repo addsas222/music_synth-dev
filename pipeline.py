@@ -304,9 +304,14 @@ class Pipeline:
             "threshold": int(raw.get("threshold") or -60),
             "timeout": 7200,
         }
-        result = runtime.run_worker(
-            python, self.workers / "ddsp_worker.py", job,
-            cwd=out_dir, timeout=7200, log_path=self.log_path)
+        result = self._run_attempts(
+            python, self.workers / "ddsp_worker.py", job, out_dir, 7200,
+            [{"job": job, "note": f"设备 {device}"}] + ([{
+                "job": {"device": "cpu"},
+                "env": {"CUDA_VISIBLE_DEVICES": "-1"},
+                "note": "GPU 显存不足，改走 CPU 变声",
+            }] if device != "cpu" else []),
+            f"[{track_id}] 变声")
         if not result.get("ok"):
             self._step(track_id, "convert", "failed", error=result.get("error"))
             self._set(track_id, status="failed", progress=60,
@@ -377,9 +382,14 @@ class Pipeline:
             "fp16": True,
         }
         self._log(f"[{track_id}] SoulX-SVC: {timbre.name} -> {Path(vocals).name}")
-        result = runtime.run_worker(
-            python, self.workers / "soulx_svc_worker.py", job,
-            cwd=out, timeout=3600, log_path=self.log_path)
+        result = self._run_attempts(
+            python, self.workers / "soulx_svc_worker.py", job, out, 3600,
+            [{"job": job, "note": f"设备 {job['device']}"}] + ([{
+                "job": {"device": "cpu", "fp16": False},
+                "env": {"CUDA_VISIBLE_DEVICES": "-1"},
+                "note": "GPU 显存不足，改走 CPU 变声",
+            }] if job["device"] != "cpu" else []),
+            f"[{track_id}] SoulX 变声")
         if not result.get("ok"):
             self._step(track_id, "convert", "failed", error=result.get("error"))
             self._set(track_id, status="failed", progress=60,
