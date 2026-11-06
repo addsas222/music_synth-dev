@@ -152,6 +152,16 @@ def inspect_checkpoint(path: str | Path) -> dict:
     }
     if framework == "ddsp-svc-reflow":
         info["arch"] = infer_arch(sd)
+        warnings = []
+        sr = info["arch"].get("sampling_rate")
+        if sr and int(sr) != 44100:
+            warnings.append(
+                f"底模采样率是 {int(sr)}，当前声码器固定 44100；"
+                "训练/推理会不匹配")
+        win = info["arch"].get("win_length")
+        if win and int(win) not in (1024, 2048):
+            warnings.append(f"底模 win_length={win}，当前预处理按 2048 编写")
+        info["warnings"] = warnings
     else:
         info["error"] = (
             f"检测到 {framework} 底模；DDSP-SVC 训练只接受 DDSP-SVC 6.x "
@@ -164,6 +174,9 @@ def normalize_checkpoint(src: str | Path, dst: str | Path) -> dict:
     info = inspect_checkpoint(src)
     if not info.get("supported"):
         raise ValueError(info.get("error") or "不支持的底模格式")
+    if int((info.get("arch") or {}).get("sampling_rate") or 44100) != 44100:
+        raise ValueError(
+            "底模采样率不是 44100，和当前声码器不匹配；请换 44.1k 底模")
     raw = load_raw(src)
     sd, global_step = unwrap(raw)
     sd = strip_prefix(sd or {})
