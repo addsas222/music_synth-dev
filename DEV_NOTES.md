@@ -208,3 +208,17 @@ ACE 原曲是立体声（左右相关约 0.93），经过「让她唱」后成�
   「检查底模」按钮；训练失败时也会明确写出不兼容原因。
 - 设置可用 `ddsp_base_low / ddsp_base_mid / ddsp_base_high` 指定三档底模路径；
   没配置时统一回退到内置 `pretrain/reflow_base/model_0.pt`。
+
+## 三档底模映射（2026-11-07）
+
+官方 `SVCFusion/DDSP6.3-Pretrain` 实际有 7 个变体，命名是 `<aux>_<main>`：
+
+- 低 = `ddsp6.3_6x512_6x512.sf_dlc`（6 层 / 512 主通道，0.09GB）
+- 中 = `ddsp6.3_6x512_6x1024.sf_dlc`（6 层 / 1024，0.20GB，原内置）
+- 高 = `ddsp6.3_6x512_10x2048.sf_dlc`（10 层 / 2048，0.97GB）
+- 其它：`6x512_6x768`(0.14) / `6x1024_6x1024`(0.31) / `10x1024_6x512`(0.27) / `10x1024_6x1024`(0.39)
+
+- 文件放 `<ddsp_root>/pretrain/bases/`，`_train_base_ckpt` 会自动找；也可用
+  `ddsp_base_low/mid/high` 显式指定。
+- 训练时自动把 `.sf_dlc` 转成 `model_0.pt`，并按推断的 arch 覆盖训练配置。
+- 自动 batch 估算会按底模层数/通道放大每 batch 显存，避免高档底模直接 OOM。

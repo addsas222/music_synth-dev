@@ -407,9 +407,21 @@ def _auto_params(state: dict, job: dict, python: Path) -> dict:
             batch = 8
             reason = "无法读取空闲显存，取保守值 8"
         else:
-            # 对齐 barbara 整合包的吞吐：约 0.7GB/batch（16GB 卡通常到 16）
-            batch = max(1, int(free_vram // 0.7))
-            reason = f"空闲显存 {free_vram:.1f}GB，按 ~0.7GB/batch 估算"
+            # 对齐 barbara 整合包的吞吐：约 0.7GB/batch（16GB 卡通常到 16）。
+            # 底模更大时按层数/通道数放大每 batch 的显存估计，避免大底模直接 OOM。
+            arch = state.get("arch") or {}
+            try:
+                model_scale = max(
+                    1.0,
+                    (float(arch.get("n_chans") or 1024) / 1024.0)
+                    * (float(arch.get("n_layers") or 6) / 6.0))
+            except (TypeError, ValueError):
+                model_scale = 1.0
+            per_batch = 0.7 * model_scale
+            batch = max(1, int(free_vram // per_batch))
+            reason = (f"空闲显存 {free_vram:.1f}GB，按 ~{per_batch:.1f}GB/batch 估算"
+                      f"（底模 {arch.get('n_layers', '?')} 层 / "
+                      f"{arch.get('n_chans', '?')} 通道）")
         p = 1
         while p * 2 <= batch:
             p *= 2

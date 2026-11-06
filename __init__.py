@@ -1027,6 +1027,16 @@ class MusicSynthPlugin(NekoPluginBase):
         chosen = str(raw.get(key) or "") if key else ""
         if chosen and Path(chosen).is_file():
             return Path(chosen)
+        # 没显式配置时，优先找随仓库放在 pretrain/bases 下的官方档位底模。
+        defaults = {
+            "low": "ddsp6.3_6x512_6x512.sf_dlc",
+            "high": "ddsp6.3_6x512_10x2048.sf_dlc",
+        }
+        if tier in defaults:
+            candidate = (Path(str(self._pipeline.paths.get("ddsp_root") or ""))
+                         / "pretrain" / "bases" / defaults[tier])
+            if candidate.is_file():
+                return candidate
         return Path(str(self._pipeline.paths.get("ddsp_pretrain_reflow") or ""))
 
     def _train_runs_root(self) -> Path:
@@ -1573,6 +1583,14 @@ class MusicSynthPlugin(NekoPluginBase):
         if not quality_base.is_file():
             return Ok({"ok": False,
                        "error": f"{qplan['label']}质量档位的训练底模不存在：{quality_base}"})
+        try:
+            mid_base = Path(str(self._pipeline.paths.get("ddsp_pretrain_reflow") or ""))
+            if quality in ("low", "high") and mid_base.is_file() and \
+                    quality_base.resolve() == mid_base.resolve():
+                quality_warnings.append(
+                    f"{qplan['label']}质量底模还没安装，本次回退到 6.3 标准底模")
+        except OSError:
+            pass
         # 「翻唱 → 原创」串联：传了 ace_models 就必须让翻唱自动跑完并保留最佳节点，
         # 否则翻唱会停在 awaiting_choice，后面的原创训练永远等不到。
         if isinstance(ace_models, str):
