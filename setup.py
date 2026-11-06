@@ -56,6 +56,19 @@ REFLOW_BASE_URLS = [
     ("https://huggingface.co/SVCFusion/DDSP6.3-Pretrain/resolve/main/"
      "ddsp6.3_6x512_6x1024.sf_dlc"),
 ]
+# 翻唱训练的低/高两档底模（同一个官方仓库的不同结构变体）。
+LOW_BASE_URLS = [
+    ("https://hf-mirror.com/SVCFusion/DDSP6.3-Pretrain/resolve/main/"
+     "ddsp6.3_6x512_6x512.sf_dlc"),
+    ("https://huggingface.co/SVCFusion/DDSP6.3-Pretrain/resolve/main/"
+     "ddsp6.3_6x512_6x512.sf_dlc"),
+]
+HIGH_BASE_URLS = [
+    ("https://hf-mirror.com/SVCFusion/DDSP6.3-Pretrain/resolve/main/"
+     "ddsp6.3_6x512_10x2048.sf_dlc"),
+    ("https://huggingface.co/SVCFusion/DDSP6.3-Pretrain/resolve/main/"
+     "ddsp6.3_6x512_10x2048.sf_dlc"),
+]
 # Fallback only if the GitHub API is unreachable.
 PYTHON_STANDALONE_PINNED = (
     "https://github.com/astral-sh/python-build-standalone/releases/download/"
@@ -96,9 +109,28 @@ MODEL_ITEMS = {
         "label": "训练底模（DDSP-SVC 6.3 PT）",
         "kind": "dlc",
         "url": REFLOW_BASE_URLS[0],
+        "urls": REFLOW_BASE_URLS,
         "target": "ddsp_pretrain_reflow",
         "size_gb": 0.21,
         "files": ("model_0.pt",),
+    },
+    "ddsp_base_low": {
+        "label": "低质量训练底模（6x512）",
+        "kind": "dlc",
+        "url": LOW_BASE_URLS[0],
+        "urls": LOW_BASE_URLS,
+        "target": "ddsp_base_low",
+        "size_gb": 0.09,
+        "files": ("low.pt",),
+    },
+    "ddsp_base_high": {
+        "label": "高质量训练底模（10x2048）",
+        "kind": "dlc",
+        "url": HIGH_BASE_URLS[0],
+        "urls": HIGH_BASE_URLS,
+        "target": "ddsp_base_high",
+        "size_gb": 0.97,
+        "files": ("high.pt",),
     },
     "sep_karaoke": {
         "label": "人声分离权重（Mel-Band RoFormer Karaoke）",
@@ -511,7 +543,12 @@ def _install_dlc_model(paths: dict, spec: dict, progress, label: str, python) ->
     target.parent.mkdir(parents=True, exist_ok=True)
     dlc = target.with_name(target.name + ".dlc")
     errors = []
-    for url in REFLOW_BASE_URLS:
+    urls = list(spec.get("urls") or [])
+    if spec.get("url") and spec["url"] not in urls:
+        urls.insert(0, spec["url"])
+    if not urls:
+        urls = list(REFLOW_BASE_URLS)
+    for url in urls:
         try:
             _download_file(url, dlc, progress, label, timeout=600)
             break
@@ -546,7 +583,9 @@ def _install_dlc_model(paths: dict, spec: dict, progress, label: str, python) ->
         dlc.unlink(missing_ok=True)
     except OSError:
         pass
-    if not target.is_file() or target.stat().st_size < 100 * 1024 * 1024:
+    min_bytes = max(20 * 1024 * 1024,
+                    int(float(spec.get("size_gb") or 0.2) * 1024 ** 3 * 0.5))
+    if not target.is_file() or target.stat().st_size < min_bytes:
         raise RuntimeError("底模转换后文件异常")
 
 

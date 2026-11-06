@@ -2165,6 +2165,9 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const [aceStatus, setAceStatus] = useState(null);
     const [aceJobId, setAceJobId] = useState("");
     const [aceJob, setAceJob] = useState(null);
+    const [baseStatus, setBaseStatus] = useState(null);
+    const [baseJobId, setBaseJobId] = useState("");
+    const [baseJob, setBaseJob] = useState(null);
     const [aceEpochs, setAceEpochs] = useState("");
     const [aceRank, setAceRank] = useState("");
     const [aceAlpha, setAceAlpha] = useState("");
@@ -2294,6 +2297,39 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
         clearInterval(id);
       };
     }, [aceJid]);
+    const loadBaseStatus = async () => {
+      try {
+        const r = await callEntry(api, "ms_base_status", {}, 3e4);
+        setBaseStatus(r);
+      } catch (e) {
+      }
+    };
+    useEffect(() => {
+      loadBaseStatus();
+    }, []);
+    useEffect(() => {
+      if (!baseJobId) return;
+      let alive = true;
+      const tick = async () => {
+        try {
+          const r = await callEntry(api, "ms_ace_job", { job_id: baseJobId }, 3e4);
+          const j = r && r.job || null;
+          if (!alive) return;
+          setBaseJob(j);
+          if (!j || j.state === "done" || j.state === "failed") {
+            setBaseJobId("");
+            loadBaseStatus();
+          }
+        } catch (e) {
+        }
+      };
+      tick();
+      const id = setInterval(tick, 3e3);
+      return () => {
+        alive = false;
+        clearInterval(id);
+      };
+    }, [baseJobId]);
     useEffect(() => {
       if (!status) return;
       const last = milestones.length ? String(milestones[milestones.length - 1].step) : "";
@@ -2332,6 +2368,17 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
         });
       } else {
         setMsg({ tone: "error", text: "底模检查失败：" + (r && r.error || "未知错误") });
+      }
+    });
+    const downloadBase = () => run("basedl", async () => {
+      const r = await callEntry(api, "ms_base_download", { tier: trainQuality }, 6e4);
+      if (r && r.ok && r.job_id) {
+        setBaseJobId(String(r.job_id));
+        setMsg({ tone: "info", text: "开始下载" + (trainQuality === "low" ? "低" : "高") + "质量底模…" });
+      } else if (r && r.ok && r.already) {
+        setMsg({ tone: "info", text: "这个档位的底模已经就绪" });
+      } else {
+        setMsg({ tone: "error", text: "没能开始下载：" + (r && r.error || "未知错误") });
       }
     });
     const deleteRun = async (withFiles) => {
@@ -2653,6 +2700,19 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
               /* @__PURE__ */ jsx(Btn, { disabled: !!busy, onClick: checkBase, children: busy === "base" ? "检查中…" : "检查底模" })
             ] }),
             /* @__PURE__ */ jsx(Muted, { style: { fontSize: 12 }, children: "低/中/高会换用对应的训练底模；显存或磁盘不够时会在这里提醒。" }),
+            (() => {
+              const info = baseStatus && baseStatus.tiers ? baseStatus.tiers[trainQuality] : null;
+              if (!info) return null;
+              if (info.exists) return /* @__PURE__ */ jsx(Muted, { style: { fontSize: 12 }, children: "底模已就绪：" + String(info.path || "").split(/[\\/]/).pop() + " · " + info.size_gb + " GB" });
+              return /* @__PURE__ */ jsxs(Row, { style: { gap: 8, flexWrap: "wrap", alignItems: "center" }, children: [
+                /* @__PURE__ */ jsx(Muted, { style: { fontSize: 12 }, children: "这档底模还没下载" }),
+                /* @__PURE__ */ jsx(Btn, { disabled: !!busy, onClick: downloadBase, children: busy === "basedl" ? "启动中…" : "下载底模" })
+              ] });
+            })(),
+            baseJob ? /* @__PURE__ */ jsxs(Col, { style: { gap: 6 }, children: [
+              /* @__PURE__ */ jsx(Bar, { pct: Number(baseJob.progress) || 0 }),
+              /* @__PURE__ */ jsx(Muted, { children: baseJob.detail || "正在下载底模…" })
+            ] }) : null,
             /* @__PURE__ */ jsxs(Row, { style: { gap: 8, flexWrap: "wrap" }, children: [
               STEPS_MODES.map((m) => /* @__PURE__ */ jsxs(
                 Btn,

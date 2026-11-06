@@ -233,6 +233,18 @@ description = "识别底模的框架与网络结构；必要时自动转换成 D
 input_schema = { type = "object", properties = { path = { type = "string", description = "底模路径；留空按 tier 解析" }, tier = { type = "string", enum = ["low", "mid", "high"] }, convert = { type = "boolean", description = "转换并保存成普通检查点" } } }
 
 [[plugin.entries]]
+id = "ms_base_status"
+name = "为她而唱 · 训练底模状态"
+description = "查看低/中/高三个训练底模是否已安装"
+input_schema = { type = "object", properties = {} }
+
+[[plugin.entries]]
+id = "ms_base_download"
+name = "为她而唱 · 下载训练底模"
+description = "下载低/高质量档位的官方 DDSP 6.3 底模（后台，带进度）"
+input_schema = { type = "object", properties = { tier = { type = "string", enum = ["low", "high"] }, force = { type = "boolean" } } }
+
+[[plugin.entries]]
 id = "ms_train_runs"
 name = "为她而唱 · 训练任务列表"
 description = "列出全部训练任务及其阶段（只读）"

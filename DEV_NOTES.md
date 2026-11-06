@@ -222,3 +222,13 @@ ACE 原曲是立体声（左右相关约 0.93），经过「让她唱」后成�
   `ddsp_base_low/mid/high` 显式指定。
 - 训练时自动把 `.sf_dlc` 转成 `model_0.pt`，并按推断的 arch 覆盖训练配置。
 - 自动 batch 估算会按底模层数/通道放大每 batch 显存，避免高档底模直接 OOM。
+
+## 分享/冷启动链路（2026-11-07）
+
+- 低/高训练底模纳入 `setup.MODEL_ITEMS`（kind=dlc，hf-mirror + HuggingFace 回退），
+  首次安装向导会下载到 `<ddsp_root>/pretrain/bases/low.pt|high.pt`。
+- `runtime.paths` 增加 `ddsp_base_low/mid/high`；`_train_base_ckpt` 按
+  配置路径 → 安装路径 → bases 下的 .sf_dlc → 内置中档 的顺序解析。
+- 新增 `ms_base_status` / `ms_base_download`；训练页在质量档位下显示
+  「底模已就绪」或「下载底模」按钮，并带真实下载进度。
+- 没有低/高档底模时训练会明确提示回退到中档，不再静默。

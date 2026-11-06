@@ -495,6 +495,10 @@ def resolve_paths(data_dir: Path, host_section: dict | None = None) -> dict:
         # 内置训练底模：DDSP-SVC 6.3 的预训练 RectifiedFlow 权重。
         # 训练一律从这里 warm start，界面上不显示、也不允许当普通声音选。
         "ddsp_pretrain_reflow": base_ckpt,
+        # 翻唱训练质量档位底模：低/高由安装清单下载到 pretrain/bases。
+        "ddsp_base_low": ddsp_root / "pretrain" / "bases" / "low.pt",
+        "ddsp_base_mid": base_ckpt,
+        "ddsp_base_high": ddsp_root / "pretrain" / "bases" / "high.pt",
         "ddsp_pretrain_contentvec": ddsp_root / "pretrain" / "contentvec" / "pytorch_model.bin",
         "ddsp_pretrain_rmvpe": ddsp_root / "pretrain" / "rmvpe" / "model.pt",
         "ddsp_pretrain_vocoder": ddsp_root / "pretrain" / "nsf_hifigan",

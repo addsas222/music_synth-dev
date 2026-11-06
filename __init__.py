@@ -1027,6 +1027,12 @@ class MusicSynthPlugin(NekoPluginBase):
         chosen = str(raw.get(key) or "") if key else ""
         if chosen and Path(chosen).is_file():
             return Path(chosen)
+        # 安装清单下载的档位底模（<ddsp_root>/pretrain/bases/low.pt|high.pt）。
+        path_key = f"ddsp_base_{tier}" if tier in ("low", "mid", "high") else ""
+        if path_key:
+            installed = Path(str(self._pipeline.paths.get(path_key) or ""))
+            if installed.is_file():
+                return installed
         # 没显式配置时，优先找随仓库放在 pretrain/bases 下的官方档位底模。
         defaults = {
             "low": "ddsp6.3_6x512_6x512.sf_dlc",
@@ -1505,6 +1511,91 @@ class MusicSynthPlugin(NekoPluginBase):
             cwd=self._train_repo(), timeout=600,
             log_path=self._pipeline.log_path)
         return Ok(result)
+
+    @plugin_entry(id="ms_base_status", name="为她而唱 · 训练底模状态",
+                  description="只读：查看低/中/高三个训练底模是否已安装",
+                  input_schema={"type": "object", "properties": {}})
+    async def ms_base_status(self, **_):
+        tiers = {}
+        for tier in ("low", "mid", "high"):
+            path = self._train_base_ckpt(tier)
+            exists = path.is_file()
+            tiers[tier] = {
+                "path": str(path), "exists": exists,
+                "size_gb": round(path.stat().st_size / 1024 ** 3, 2) if exists else 0,
+            }
+        return Ok({"ok": True, "tiers": tiers,
+                   "bases_dir": str(Path(str(self._pipeline.paths.get("ddsp_root") or ""))
+                                     / "pretrain" / "bases")})
+
+    @plugin_entry(id="ms_base_download", name="为她而唱 · 下载训练底模",
+                  description="下载低/高质量档位的官方 DDSP 6.3 底模（后台，带进度）",
+                  input_schema={"type": "object", "properties": {
+                      "tier": {"type": "string", "enum": ["low", "high"]},
+                      "force": {"type": "boolean"}}})
+    async def ms_base_download(self, tier: str = "", force=False, **_):
+        tier = str(tier or "").strip().lower()
+        if tier not in ("low", "high"):
+            return Ok({"ok": False,
+                       "error": "只有 low / high 需要单独下载；mid 用内置底模"})
+        if not self._pipeline.paths.get("configured"):
+            return Ok({"ok": False, "error": "还没有选择安装位置"})
+        spec = setup_mod.MODEL_ITEMS.get(f"ddsp_base_{tier}")
+        target = Path(str(self._pipeline.paths.get(f"ddsp_base_{tier}") or ""))
+        if not spec or not str(target):
+            return Ok({"ok": False, "error": "这个档位没有配置底模路径"})
+        if target.is_file() and not _as_bool(force):
+            return Ok({"ok": True, "already": True, "tier": tier,
+                       "path": str(target)})
+        expected = float(spec.get("size_gb") or 0.0) * 1024 ** 3
+        job_id = self._job_begin("ddsp-base-download")
+
+        def run():
+            self._job_update(job_id, state="running", progress=5,
+                             detail=f"正在下载{tier}质量底模…")
+            stop = threading.Event()
+            tmp = target.with_name(target.name + ".dlc")
+
+            def watch():
+                last = -1
+                while not stop.wait(2.0):
+                    try:
+                        cur = tmp.stat().st_size if tmp.is_file() else (
+                            target.stat().st_size if target.is_file() else 0)
+                    except OSError:
+                        cur = 0
+                    if expected <= 0:
+                        continue
+                    pct = max(5, min(95, int(5 + 90 * cur / expected)))
+                    if pct == last:
+                        continue
+                    last = pct
+                    self._job_update(
+                        job_id, progress=pct,
+                        detail=f"正在下载{tier}质量底模："
+                               f"{cur / 1024 ** 3:.2f} / {expected / 1024 ** 3:.2f} GB")
+
+            watcher = threading.Thread(target=watch, daemon=True)
+            watcher.start()
+            try:
+                setup_mod.install(
+                    self._pipeline.paths, [f"ddsp_base_{tier}"],
+                    lambda msg: self._job_update(job_id, detail=str(msg)))
+            except Exception as exc:  # noqa: BLE001
+                self._job_update(job_id, state="failed", progress=100,
+                                 detail=f"{type(exc).__name__}: {exc}")
+                return
+            finally:
+                stop.set()
+            if target.is_file():
+                self._job_update(job_id, state="done", progress=100,
+                                 detail=f"{tier}质量底模已就绪：{target.name}")
+            else:
+                self._job_update(job_id, state="failed", progress=100,
+                                 detail="下载结束但底模文件不存在，请重试")
+
+        self._thread(f"ms-base-download-{job_id}", run)
+        return Ok({"ok": True, "job_id": job_id, "tier": tier})
 
     @plugin_entry(id="ms_train_start", name="为她而唱 · 训练新音色",
                   description="用上传的声音素材训练一个属于自己的变声模型：自动整理数据、提特征、定参数，"
