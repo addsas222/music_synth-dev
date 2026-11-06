@@ -27,7 +27,9 @@ class _Host(GenerateMusicRequestMixin):
         self.prepare_batch_data = lambda *args, **kwargs: (
             ["cap"], ["inst"], ["lyr"], ["en"], ["meta"]
         )
-        self.determine_task_type = lambda task, codes: (False, False, task == "cover", True)
+        self.determine_task_type = lambda task, codes: (
+            False, False, task in ("cover", "cover-nofsq"), True
+        )
         self.prepare_padding_info = lambda *args, **kwargs: ([0.0], [1.0], torch.zeros(1, 2, 100))
 
 
@@ -110,6 +112,86 @@ class GenerateMusicRequestMixinTests(unittest.TestCase):
         self.assertIsNotNone(error)
         self.assertFalse(error["success"])
         self.assertEqual(error["error"], "Invalid source audio")
+
+
+    def test_cover_no_src_audio_with_codes_succeeds(self):
+        """Cover task should succeed without src_audio when audio codes are provided."""
+        host = _Host()
+        _, processed_src_audio, error = host._prepare_reference_and_source_audio(
+            reference_audio=None,
+            src_audio=None,
+            audio_code_string="<|audio_code_42|>",
+            actual_batch_size=1,
+            task_type="cover",
+        )
+        self.assertIsNone(error)
+        self.assertIsNone(processed_src_audio)
+
+    def test_cover_no_src_audio_no_codes_errors(self):
+        """Cover task without src_audio and without audio codes should error."""
+        host = _Host()
+        _, _, error = host._prepare_reference_and_source_audio(
+            reference_audio=None,
+            src_audio=None,
+            audio_code_string="",
+            actual_batch_size=1,
+            task_type="cover",
+        )
+        self.assertIsNotNone(error)
+        self.assertFalse(error["success"])
+        self.assertIn("requires source audio", error["error"])
+
+    def test_cover_nofsq_no_src_audio_no_codes_errors(self):
+        """Raw cover task without src_audio and without audio codes should error."""
+        host = _Host()
+        _, _, error = host._prepare_reference_and_source_audio(
+            reference_audio=None,
+            src_audio=None,
+            audio_code_string="",
+            actual_batch_size=1,
+            task_type="cover-nofsq",
+        )
+        self.assertIsNotNone(error)
+        self.assertFalse(error["success"])
+        self.assertIn("requires source audio", error["error"])
+
+    def test_repaint_no_src_audio_with_codes_succeeds(self):
+        """Repaint task should succeed without src_audio when audio codes are provided."""
+        host = _Host()
+        _, processed_src_audio, error = host._prepare_reference_and_source_audio(
+            reference_audio=None,
+            src_audio=None,
+            audio_code_string="<|audio_code_99|>",
+            actual_batch_size=1,
+            task_type="repaint",
+        )
+        self.assertIsNone(error)
+        self.assertIsNone(processed_src_audio)
+
+    def test_should_return_intermediate_always_true(self):
+        """Intermediate tensors must always be returned for LRC generation support."""
+        host = _Host()
+        for task in ("text2music", "cover", "cover-nofsq", "repaint"):
+            inputs = host._prepare_generate_music_service_inputs(
+                actual_batch_size=1,
+                processed_src_audio=None,
+                audio_duration=60.0,
+                captions="test",
+                lyrics="test",
+                vocal_language="en",
+                instruction="inst",
+                bpm=120,
+                key_scale="C major",
+                time_signature="4/4",
+                task_type=task,
+                audio_code_string="",
+                repainting_start=0.0,
+                repainting_end=1.0,
+            )
+            self.assertTrue(
+                inputs["should_return_intermediate"],
+                f"should_return_intermediate must be True for task_type={task!r}",
+            )
 
 
 if __name__ == "__main__":

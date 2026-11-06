@@ -62,6 +62,8 @@ class GenerateMusicRequestMixin:
         repainting_end: Optional[float],
         seed: Optional[Union[str, float, int]],
         use_random_seed: bool,
+        retake_seed: Optional[Union[str, float, int]] = None,
+        retake_variance: float = 0.0,
     ) -> Dict[str, Any]:
         """Prepare runtime batch/seed/duration values for generation."""
         self.current_offload_cost = 0.0
@@ -69,6 +71,17 @@ class GenerateMusicRequestMixin:
         actual_batch_size = max(1, actual_batch_size)
         actual_batch_size = self._vram_guard_reduce_batch(actual_batch_size, audio_duration=audio_duration)
         actual_seed_list, seed_value_for_ui = self.prepare_seeds(actual_batch_size, seed, use_random_seed)
+
+        # Retake seeds are only resolved when the variance gate is open. Reusing
+        # prepare_seeds here lets empty/`-1` user input fall back to fresh random
+        # seeds, matching the main seed semantics so that the recorded
+        # retake_seed_value_for_ui is reproducible.
+        actual_retake_seed_list: Optional[List[int]] = None
+        retake_seed_value_for_ui = ""
+        if retake_variance > 0.0:
+            actual_retake_seed_list, retake_seed_value_for_ui = self.prepare_seeds(
+                actual_batch_size, retake_seed, use_random_seed=False
+            )
 
         if audio_duration is not None and float(audio_duration) <= 0:
             audio_duration = None
@@ -79,6 +92,8 @@ class GenerateMusicRequestMixin:
             "actual_batch_size": actual_batch_size,
             "actual_seed_list": actual_seed_list,
             "seed_value_for_ui": seed_value_for_ui,
+            "actual_retake_seed_list": actual_retake_seed_list,
+            "retake_seed_value_for_ui": retake_seed_value_for_ui,
             "audio_duration": audio_duration,
             "repainting_end": repainting_end,
         }
@@ -90,6 +105,7 @@ class GenerateMusicRequestMixin:
         audio_code_string: Union[str, List[str]],
         actual_batch_size: int,
         task_type: str,
+        flow_edit_morph: bool = False,
     ) -> Tuple[Optional[List[List[torch.Tensor]]], Optional[torch.Tensor], Optional[Dict[str, Any]]]:
         """Prepare reference/source audio tensors and return early error payload when invalid."""
         if reference_audio is not None:
@@ -111,9 +127,35 @@ class GenerateMusicRequestMixin:
             refer_audios = [[torch.zeros(2, 30 * self.sample_rate)] for _ in range(actual_batch_size)]
 
         processed_src_audio = None
-        if task_type == "text2music":
+        _src_audio_required_tasks = {"cover", "cover-nofsq", "repaint", "lego", "extract"}
+        if task_type == "text2music" and not flow_edit_morph:
             if src_audio is not None:
                 logger.info("[generate_music] text2music task does not use src_audio, ignoring")
+        elif task_type == "text2music" and flow_edit_morph:
+            # Treat empty string / empty list as missing too — gradio
+            # occasionally hands ``""`` instead of ``None`` for cleared
+            # components.
+            src_audio_missing = (
+                src_audio is None
+                or (isinstance(src_audio, str) and not src_audio.strip())
+                or (isinstance(src_audio, (list, tuple)) and not src_audio)
+            )
+            if src_audio_missing:
+                return None, None, {
+                    "audios": [],
+                    "status_message": "Flow-edit morph requires a source audio. Please upload one or disable Smooth morph.",
+                    "extra_outputs": {}, "success": False,
+                    "error": "flow_edit_morph=True requires src_audio",
+                }
+            logger.info("[generate_music] text2music + flow_edit_morph: encoding src_audio for V_delta integration")
+            processed_src_audio = self.process_src_audio(src_audio)
+            if processed_src_audio is None:
+                return None, None, {
+                    "audios": [],
+                    "status_message": "Flow-edit morph: source audio is invalid, unreadable, or silent.",
+                    "extra_outputs": {}, "success": False,
+                    "error": "Invalid source audio for flow_edit_morph",
+                }
         elif src_audio is not None:
             if self._has_non_empty_audio_codes(audio_code_string):
                 logger.info("[generate_music] Audio codes provided, ignoring src_audio and using codes instead")
@@ -132,6 +174,23 @@ class GenerateMusicRequestMixin:
                         "success": False,
                         "error": "Invalid source audio",
                     }
+        elif task_type in _src_audio_required_tasks:
+            if self._has_non_empty_audio_codes(audio_code_string):
+                logger.info(
+                    "[generate_music] {} task: no src_audio but audio codes provided, proceeding with codes",
+                    task_type,
+                )
+            else:
+                return None, None, {
+                    "audios": [],
+                    "status_message": (
+                        f"Task '{task_type}' requires source audio, but none was provided. "
+                        f"Please upload a source audio file."
+                    ),
+                    "extra_outputs": {},
+                    "success": False,
+                    "error": f"Task '{task_type}' requires source audio",
+                }
 
         return refer_audios, processed_src_audio, None
 
@@ -141,16 +200,18 @@ class GenerateMusicRequestMixin:
         processed_src_audio: Optional[torch.Tensor],
         audio_duration: Optional[float],
         captions: str,
-        lyrics: str,
-        vocal_language: str,
-        instruction: str,
-        bpm: Optional[int],
-        key_scale: str,
-        time_signature: str,
-        task_type: str,
-        audio_code_string: Union[str, List[str]],
-        repainting_start: float,
-        repainting_end: Optional[float],
+        global_caption: str = "",
+        lyrics: str = "",
+        vocal_language: str = "en",
+        instruction: str = "",
+        bpm: Optional[int] = None,
+        key_scale: str = "",
+        time_signature: str = "",
+        task_type: str = "text2music",
+        audio_code_string: Union[str, List[str]] = "",
+        repainting_start: float = 0.0,
+        repainting_end: Optional[float] = None,
+        chunk_mask_mode: str = "auto",
     ) -> Dict[str, Any]:
         """Prepare service inputs (batch text, repaint spans, and optional code hints)."""
         captions_batch, instructions_batch, lyrics_batch, vocal_languages_batch, metas_batch = self.prepare_batch_data(
@@ -165,11 +226,9 @@ class GenerateMusicRequestMixin:
             key_scale,
             time_signature,
         )
+        global_captions_batch = [global_caption] * actual_batch_size
 
-        is_repaint_task, is_lego_task, is_cover_task, can_use_repainting = self.determine_task_type(
-            task_type,
-            audio_code_string,
-        )
+        is_repaint_task, is_lego_task, is_cover_task, can_use_repainting = self.determine_task_type(task_type, audio_code_string)
         repainting_start_batch, repainting_end_batch, target_wavs_tensor = self.prepare_padding_info(
             actual_batch_size,
             processed_src_audio,
@@ -181,7 +240,6 @@ class GenerateMusicRequestMixin:
             is_cover_task,
             can_use_repainting,
         )
-
         audio_code_hints_batch = None
         if self._has_non_empty_audio_codes(audio_code_string):
             if isinstance(audio_code_string, list):
@@ -191,6 +249,7 @@ class GenerateMusicRequestMixin:
 
         return {
             "captions_batch": captions_batch,
+            "global_captions_batch": global_captions_batch,
             "instructions_batch": instructions_batch,
             "lyrics_batch": lyrics_batch,
             "vocal_languages_batch": vocal_languages_batch,
@@ -199,6 +258,6 @@ class GenerateMusicRequestMixin:
             "repainting_end_batch": repainting_end_batch,
             "target_wavs_tensor": target_wavs_tensor,
             "audio_code_hints_batch": audio_code_hints_batch,
-            "should_return_intermediate": task_type == "text2music",
+            "chunk_mask_modes_batch": [chunk_mask_mode] * actual_batch_size,
+            "should_return_intermediate": True,
         }
-
