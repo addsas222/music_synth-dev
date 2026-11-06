@@ -19,7 +19,10 @@ import json
 import os
 import re
 import sys
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 (build host may be older than the plugin runtime)
+    import tomli as tomllib
 import unicodedata
 import zipfile
 from pathlib import Path
