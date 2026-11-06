@@ -38,6 +38,9 @@ from datetime import datetime
 from typing import Callable
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from base_ckpt import normalize_checkpoint  # noqa: E402
+
 MILESTONES_DEFAULT = [1000, 2000, 4000, 8000, 12000, 16000]
 MIN_TOTAL_SEC = 60.0        # 总时长 <60s 拒绝
 WARN_TOTAL_SEC = 180.0      # 总时长 <180s 警告（不拒绝）
@@ -514,6 +517,24 @@ def _dump_yaml(path: Path, obj: dict) -> None:
 
 def _build_config(state: dict, params: dict, run_dir: Path, repo: Path) -> Path:
     cfg = _load_reflow(repo)
+    # 底模自描述结构：训练前由 base_ckpt.py 从权重形状推断出来，写进 state["arch"]。
+    # 这里把 reflow.yaml 的默认结构覆盖成底模实际的结构，避免架构不匹配。
+    arch = state.get("arch") or {}
+    if arch:
+        dcfg = cfg.setdefault("data", {})
+        for key in ("sampling_rate", "block_size"):
+            if arch.get(key):
+                dcfg[key] = int(arch[key])
+        if arch.get("encoder"):
+            dcfg["encoder"] = arch["encoder"]
+            dcfg["encoder_hop_size"] = int(arch.get("encoder_hop_size") or 160)
+            dcfg["encoder_out_channels"] = int(arch.get("encoder_out_channels") or 768)
+        mcfg = cfg.setdefault("model", {})
+        for key in ("win_length", "n_layers", "n_chans", "n_aux_layers", "n_aux_chans"):
+            if arch.get(key):
+                mcfg[key] = int(arch[key])
+        mcfg["use_pitch_aug"] = bool(arch.get("use_pitch_aug", True))
+        mcfg["n_spk"] = int(arch.get("n_spk") or 1)
     cfg["data"]["train_path"] = str(run_dir / "data" / "train")
     cfg["data"]["valid_path"] = str(run_dir / "data" / "val")
     cfg["data"]["duration"] = float(params["duration"])
@@ -849,14 +870,23 @@ def main() -> int:
                 steps0 = _ckpt_steps(init_src)
                 try:
                     expdir.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(init_src, expdir / f"model_{steps0}.pt")
+                    # 自动识别底模框架/格式并转成 DDSP-SVC 需要的
+                    # {'global_step','model'} 普通检查点；同时把结构写进 state。
+                    info = normalize_checkpoint(init_src, expdir / f"model_{steps0}.pt")
+                    state["arch"] = info.get("arch") or {}
+                    state["base_info"] = {k: v for k, v in info.items() if k != "arch"}
                     state["init_seeded"] = str(init_src)
                     state["init_step"] = steps0
                     state["step"] = max(int(state.get("step") or 0), steps0)
                     save_state()
-                    log(f"从固定起点加载：{init_src}（step {steps0}）")
-                except OSError as exc:
-                    log(f"复制初始模型失败，按从零训练：{exc}")
+                    log(f"底模：{info.get('framework')} · "
+                        f"{state['arch'].get('n_layers')} 层 / "
+                        f"{state['arch'].get('n_chans')} 通道 · 已转换并加载：{init_src}")
+                except Exception as exc:  # noqa: BLE001
+                    state["phase"] = "failed"
+                    state["error"] = f"底模不兼容：{type(exc).__name__}: {exc}"
+                    save_state()
+                    raise RuntimeError(state["error"]) from exc
 
         # 阶段 3 + 2：定参 + preprocess（幂等：units 目录已存在就跳过）
         # 注：auto / auto_cap 由 _auto_params 依据 job 决定；恢复时沿用已存的 milestones。

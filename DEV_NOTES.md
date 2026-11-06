@@ -193,3 +193,18 @@ ACE 原曲是立体声（左右相关约 0.93），经过「让她唱」后成�
 - **下载实测**：`acestep-v15-sft`（ModelScope）4.5GB 下载成功，10s/50 步生成成功。
   注意：sft 是 2B 模型，现有 `梦梦op` LoRA 只有 turbo / xl_turbo 变体；要用 sft 唱她的声音，
   需要再训练一个 sft 版 LoRA（`ms_ace_train` 默认会训练所有已下载底模）。
+
+## 底模兼容层（2026-11-06 夜）
+
+- 新增 `workers/base_ckpt.py`：解析底模并从张量形状推断结构。
+  - 支持 DDSP-SVC 6.x `{global_step, model}`、SVCFusion `.sf_dlc` 容器、
+    plain state_dict / `{state_dict|weight|model}`、`module.` 前缀。
+  - 识别 RVC / so-vits-svc 并明确拒绝（架构不兼容，不能静默转换）。
+  - 推断 sampling_rate / block_size / win_length / n_layers / n_chans /
+    n_aux_layers / n_aux_chans / use_pitch_aug / encoder。
+- 训练启动时自动把底模转成 `<expdir>/model_0.pt`，把结构写进 `state["arch"]`；
+  `train_session_worker._build_config` 用 arch 覆盖 `configs/reflow.yaml` 的默认结构。
+- 新增入口 `ms_base_inspect`（path / tier / convert），面板「翻唱训练强度」旁有
+  「检查底模」按钮；训练失败时也会明确写出不兼容原因。
+- 设置可用 `ddsp_base_low / ddsp_base_mid / ddsp_base_high` 指定三档底模路径；
+  没配置时统一回退到内置 `pretrain/reflow_base/model_0.pt`。

@@ -1463,6 +1463,39 @@ class MusicSynthPlugin(NekoPluginBase):
             view["chain"] = chain
         return view
 
+    @plugin_entry(id="ms_base_inspect", name="为她而唱 · 检查训练底模",
+                  description="识别底模的框架与网络结构；必要时自动转换成 DDSP-SVC 可训练的格式",
+                  input_schema={"type": "object", "properties": {
+                      "path": {"type": "string",
+                               "description": "底模路径；留空则按 tier 解析"},
+                      "tier": {"type": "string", "enum": ["low", "mid", "high"],
+                               "description": "按质量档位取底模（path 为空时生效）"},
+                      "convert": {"type": "boolean",
+                                  "description": "转换并保存成普通 {global_step, model} 检查点"}}})
+    async def ms_base_inspect(self, path: str = "", tier: str = "mid",
+                              convert=False, **_):
+        python = self._train_python()
+        if not python.is_file():
+            return Ok({"ok": False, "error": "DDSP 环境还没就绪"})
+        target = Path(str(path).strip()) if str(path).strip() \
+            else self._train_base_ckpt(tier)
+        if not target.is_file():
+            return Ok({"ok": False, "error": f"底模不存在：{target}",
+                       "path": str(target)})
+        job = {"path": str(target)}
+        if _as_bool(convert):
+            out_dir = self._train_runs_root() / "bases"
+            try:
+                out_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                return Ok({"ok": False, "error": f"无法创建转换目录：{exc}"})
+            job["convert"] = str(out_dir / f"{target.stem}_{int(time.time())}.pt")
+        result = runtime.run_worker(
+            python, self._train_worker("base_ckpt.py"), job,
+            cwd=self._train_repo(), timeout=600,
+            log_path=self._pipeline.log_path)
+        return Ok(result)
+
     @plugin_entry(id="ms_train_start", name="为她而唱 · 训练新音色",
                   description="用上传的声音素材训练一个属于自己的变声模型：自动整理数据、提特征、定参数，"
                               "每到里程碑停下生成一段试听，等你决定继续/停止/保留",

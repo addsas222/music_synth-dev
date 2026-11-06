@@ -2322,6 +2322,18 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
         setBusy("");
       }
     }
+    const checkBase = () => run("base", async () => {
+      const r = await callEntry(api, "ms_base_inspect", { tier: trainQuality }, 12e4);
+      if (r && r.ok) {
+        const a = r.arch || {};
+        setMsg({
+          tone: "info",
+          text: "底模：" + (r.framework || "未知") + " · " + (a.n_layers || "?") + " 层 / " + (a.n_chans || "?") + " 通道" + (a.encoder ? " · " + a.encoder : "") + " · " + (r.path || "")
+        });
+      } else {
+        setMsg({ tone: "error", text: "底模检查失败：" + (r && r.error || "未知错误") });
+      }
+    });
     const deleteRun = async (withFiles) => {
       setDelRun(false);
       if (!runId) return;
@@ -2637,7 +2649,8 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
                   setStepMode(k === "low" ? "speed" : k === "high" ? "quality" : "normal");
                 },
                 children: [label, "质量"]
-              }, k))
+              }, k)),
+              /* @__PURE__ */ jsx(Btn, { disabled: !!busy, onClick: checkBase, children: busy === "base" ? "检查中…" : "检查底模" })
             ] }),
             /* @__PURE__ */ jsx(Muted, { style: { fontSize: 12 }, children: "低/中/高会换用对应的训练底模；显存或磁盘不够时会在这里提醒。" }),
             /* @__PURE__ */ jsxs(Row, { style: { gap: 8, flexWrap: "wrap" }, children: [
